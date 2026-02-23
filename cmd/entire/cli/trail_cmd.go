@@ -341,6 +341,45 @@ func runTrailUpdate(w io.Writer, statusStr, title, description, branch string, l
 		return fmt.Errorf("no trail found for branch %q", branch)
 	}
 
+	// Interactive mode when no flags are provided
+	noFlags := statusStr == "" && title == "" && description == "" && labelAdd == nil && labelRemove == nil
+	if noFlags {
+		// Build status options with current value as default
+		// Exclude "done" (set on merge) and "closed" (requires permissions)
+		var statusOptions []huh.Option[string]
+		for _, s := range trail.ValidStatuses() {
+			if s == trail.StatusDone || s == trail.StatusClosed {
+				continue
+			}
+			label := string(s)
+			if s == metadata.Status {
+				label += " (current)"
+			}
+			statusOptions = append(statusOptions, huh.NewOption(label, string(s)))
+		}
+		statusStr = string(metadata.Status)
+		title = metadata.Title
+		description = metadata.Description
+
+		form := NewAccessibleForm(
+			huh.NewGroup(
+				huh.NewSelect[string]().
+					Title("Status").
+					Options(statusOptions...).
+					Value(&statusStr),
+				huh.NewInput().
+					Title("Title").
+					Value(&title),
+				huh.NewText().
+					Title("Description").
+					Value(&description),
+			),
+		)
+		if formErr := form.Run(); formErr != nil {
+			return fmt.Errorf("form cancelled: %w", formErr)
+		}
+	}
+
 	// Validate status if provided
 	if statusStr != "" {
 		status := trail.Status(statusStr)
