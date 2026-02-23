@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/trail"
 
@@ -103,6 +104,9 @@ func newTrailListCmd() *cobra.Command {
 }
 
 func runTrailListAll(w io.Writer, statusFilter string, jsonOutput bool) error {
+	// Fetch remote trails branch so we see trails from collaborators
+	fetchTrailsBranch()
+
 	repo, err := strategy.OpenRepository()
 	if err != nil {
 		return fmt.Errorf("failed to open repository: %w", err)
@@ -620,6 +624,18 @@ func runTrailCreateInteractive(title, description, branch, statusStr *string) er
 		*branch = suggested
 	}
 	return nil
+}
+
+// fetchTrailsBranch fetches the remote trails branch so we see trails from collaborators.
+// Best-effort: silently ignores errors (e.g., no remote, no network).
+func fetchTrailsBranch() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	branchName := paths.TrailsBranchName
+	refSpec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branchName, branchName)
+	//nolint:gosec // G204: branchName is a constant from paths package
+	cmd := exec.CommandContext(ctx, "git", "fetch", "origin", refSpec)
+	_ = cmd.Run() //nolint:errcheck // best-effort fetch
 }
 
 // getTrailAuthor returns the GitHub username for the trail author.
