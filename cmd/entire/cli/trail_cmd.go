@@ -16,6 +16,7 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/spf13/cobra"
 )
 
@@ -169,12 +170,13 @@ func runTrailListAll(w io.Writer, statusFilter string, jsonOutput bool) error {
 
 func newTrailCreateCmd() *cobra.Command {
 	var title, description, base, branch, status string
+	var checkout bool
 
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a trail for the current or a new branch",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runTrailCreate(cmd.OutOrStdout(), cmd.ErrOrStderr(), title, description, base, branch, status)
+			return runTrailCreate(cmd.OutOrStdout(), cmd.ErrOrStderr(), title, description, base, branch, status, checkout)
 		},
 	}
 
@@ -183,30 +185,16 @@ func newTrailCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&base, "base", "", "Base branch (defaults to detected default branch)")
 	cmd.Flags().StringVar(&branch, "branch", "", "Branch for the trail (defaults to current branch)")
 	cmd.Flags().StringVar(&status, "status", "", "Initial status (defaults to draft)")
+	cmd.Flags().BoolVar(&checkout, "checkout", false, "Check out the branch after creating it")
 
 	return cmd
 }
 
 //nolint:cyclop // sequential steps for creating a trail — splitting would obscure the flow
-func runTrailCreate(w, errW io.Writer, title, description, base, branch, statusStr string) error {
+func runTrailCreate(w, errW io.Writer, title, description, base, branch, statusStr string, checkout bool) error {
 	repo, err := strategy.OpenRepository()
 	if err != nil {
 		return fmt.Errorf("failed to open repository: %w", err)
-	}
-
-	// Determine branch
-	if branch == "" {
-		branch, err = GetCurrentBranch()
-		if err != nil {
-			return fmt.Errorf("failed to determine current branch: %w", err)
-		}
-	}
-
-	// Check if on default branch
-	if isDefault, _, defaultErr := IsOnDefaultBranch(); defaultErr == nil && isDefault {
-		fmt.Fprintln(errW, "Cannot create a trail on the default branch.")
-		fmt.Fprintln(errW, "Create or switch to a feature branch first.")
-		return NewSilentError(errors.New("cannot create trail on default branch"))
 	}
 
 	// Determine base branch
@@ -215,6 +203,44 @@ func runTrailCreate(w, errW io.Writer, title, description, base, branch, statusS
 		if base == "" {
 			base = defaultBaseBranch
 		}
+	}
+
+	// Determine branch — create and checkout if needed
+	isDefault, currentBranch, _ := IsOnDefaultBranch() //nolint:errcheck // best-effort detection
+	if branch == "" {
+		if !isDefault {
+			branch = currentBranch
+		} else {
+			// On default branch with no --branch flag: prompt for a new branch name
+			var inputBranch string
+			form := NewAccessibleForm(
+				huh.NewGroup(
+					huh.NewInput().
+						Title("Branch name").
+						Placeholder("feat/my-feature").
+						Value(&inputBranch),
+				),
+			)
+			if formErr := form.Run(); formErr != nil {
+				return fmt.Errorf("form cancelled: %w", formErr)
+			}
+			inputBranch = strings.TrimSpace(inputBranch)
+			if inputBranch == "" {
+				return errors.New("branch name is required")
+			}
+			branch = inputBranch
+		}
+	}
+
+	// Create the branch if it doesn't exist
+	needsCreation := branchNeedsCreation(repo, branch)
+	if needsCreation {
+		if err := createBranch(repo, branch); err != nil {
+			return fmt.Errorf("failed to create branch %q: %w", branch, err)
+		}
+		fmt.Fprintf(w, "Created branch %s\n", branch)
+	} else if currentBranch != branch {
+		fmt.Fprintf(errW, "Note: trail will be created for branch %q (not the current branch)\n", branch)
 	}
 
 	// Check if trail already exists for this branch
@@ -293,6 +319,31 @@ func runTrailCreate(w, errW io.Writer, title, description, base, branch, statusS
 	}
 
 	fmt.Fprintf(w, "Created trail %q for branch %s (ID: %s)\n", title, branch, trailID)
+
+	// Checkout the branch if requested or prompted
+	if needsCreation && currentBranch != branch {
+		shouldCheckout := checkout
+		if !shouldCheckout && !hasFlag("checkout") {
+			// Interactive: ask whether to checkout
+			form := NewAccessibleForm(
+				huh.NewGroup(
+					huh.NewConfirm().
+						Title(fmt.Sprintf("Check out branch %s?", branch)).
+						Value(&shouldCheckout),
+				),
+			)
+			if formErr := form.Run(); formErr == nil && shouldCheckout {
+				checkout = true
+			}
+		}
+		if checkout {
+			if err := CheckoutBranch(branch); err != nil {
+				return fmt.Errorf("failed to checkout branch %q: %w", branch, err)
+			}
+			fmt.Fprintf(w, "Switched to branch %s\n", branch)
+		}
+	}
+
 	return nil
 }
 
@@ -525,4 +576,23 @@ func removeString(slice []string, s string) []string {
 		}
 	}
 	return result
+}
+
+// branchNeedsCreation checks if a branch exists locally.
+func branchNeedsCreation(repo *git.Repository, branchName string) bool {
+	_, err := repo.Reference(plumbing.NewBranchReferenceName(branchName), true)
+	return err != nil
+}
+
+// createBranch creates a new local branch pointing at HEAD without checking it out.
+func createBranch(repo *git.Repository, branchName string) error {
+	head, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("failed to get HEAD: %w", err)
+	}
+	ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName(branchName), head.Hash())
+	if err := repo.Storer.SetReference(ref); err != nil {
+		return fmt.Errorf("failed to create branch ref: %w", err)
+	}
+	return nil
 }
