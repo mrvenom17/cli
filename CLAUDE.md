@@ -352,8 +352,8 @@ All strategies implement:
 **Command:** `entire trail` — manage trails for branches
 - `entire trail` — show current branch's trail, or list all
 - `entire trail list` — list all trails (`--status`, `--json` flags)
-- `entire trail create` — create a trail (interactive or via `--title`, `--branch`, `--status` flags)
-- `entire trail update` — update trail metadata (`--status`, `--title`, `--add-label`, `--remove-label` flags)
+- `entire trail create` — create a trail (interactive or via `--title`, `--body`, `--branch`, `--status` flags)
+- `entire trail update` — update trail metadata (`--status`, `--title`, `--body`, `--add-label`, `--remove-label` flags)
 
 **Auto-create:** On session TurnStart, if on a non-main branch without a trail, one is auto-created with `in_progress` status. The trail title is derived from the user's first prompt (first line, max 80 chars); falls back to `HumanizeBranchName()` if no prompt is available.
 
@@ -364,7 +364,7 @@ All strategies implement:
 **Storage:** `entire/trails` orphan branch with sharded paths:
 ```
 <trail_id[:2]>/<trail_id[2:]>/
-├── metadata.json       # Trail metadata (title, branch, status, etc.)
+├── metadata.json       # Trail metadata (title, body, branch, status, etc.)
 ├── discussion.json     # Comments and replies
 └── checkpoints.json    # Checkpoint references (newest first)
 ```
