@@ -60,7 +60,11 @@ func ReconcileDisconnectedMetadataBranch(repo *git.Repository) error {
 		return err
 	}
 
-	if !isDisconnected(repoPath, localHash.String(), remoteHash.String()) {
+	disconnected, err := isDisconnected(repoPath, localHash.String(), remoteHash.String())
+	if err != nil {
+		return fmt.Errorf("failed to check metadata branch ancestry: %w", err)
+	}
+	if !disconnected {
 		// Shared ancestry (diverged or ancestor) — not our problem
 		return nil
 	}
@@ -114,15 +118,26 @@ func ReconcileDisconnectedMetadataBranch(repo *git.Repository) error {
 }
 
 // isDisconnected checks if two commits have no common ancestor using git merge-base.
-// Returns true if disconnected (exit non-zero), false if they share ancestry.
-func isDisconnected(repoPath, hashA, hashB string) bool {
+// Returns (true, nil) if disconnected, (false, nil) if they share ancestry,
+// or (false, error) if git merge-base failed for another reason.
+//
+// git merge-base exit codes:
+//   - 0: common ancestor found (shared ancestry)
+//   - 1: no common ancestor (disconnected)
+//   - 128+: error (corrupt repo, invalid hash, etc.)
+func isDisconnected(repoPath, hashA, hashB string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "merge-base", hashA, hashB)
 	cmd.Dir = repoPath
-	// Exit 0 → shared ancestry → not disconnected
-	// Exit non-zero → no common ancestor → disconnected
-	return cmd.Run() != nil
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return true, nil // No common ancestor — disconnected
+		}
+		return false, fmt.Errorf("git merge-base failed: %w", err)
+	}
+	return false, nil // Shared ancestry
 }
 
 // collectCommitChain walks from tip to root following first parent, returns oldest-first.
