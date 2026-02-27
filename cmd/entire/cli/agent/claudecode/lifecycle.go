@@ -250,9 +250,10 @@ func waitForTranscriptFlush(ctx context.Context, transcriptPath string, hookStar
 	if err != nil {
 		return // file doesn't exist, nothing to wait for
 	}
-	if time.Since(info.ModTime()) > staleThreshold {
+	fileAge := time.Since(info.ModTime())
+	if fileAge > staleThreshold {
 		logging.Debug(logCtx, "transcript file is stale, skipping sentinel wait",
-			slog.Duration("file_age", time.Since(info.ModTime())),
+			slog.Duration("file_age", fileAge),
 		)
 		return
 	}
