@@ -53,13 +53,10 @@ func (a *OpenCodeAgent) ParseHookEvent(ctx context.Context, hookName string, std
 		if err != nil {
 			return nil, err
 		}
-		// Get the temp file path for this session (may not exist yet, but needed for pre-prompt state).
-		repoRoot, err := paths.WorktreeRoot(ctx)
+		transcriptPath, err := sessionTranscriptPath(ctx, raw.SessionID)
 		if err != nil {
-			repoRoot = "."
+			return nil, err
 		}
-		tmpDir := filepath.Join(repoRoot, paths.EntireTmpDir)
-		transcriptPath := filepath.Join(tmpDir, raw.SessionID+".json")
 		return &agent.Event{
 			Type:       agent.TurnStart,
 			SessionID:  raw.SessionID,
@@ -73,10 +70,10 @@ func (a *OpenCodeAgent) ParseHookEvent(ctx context.Context, hookName string, std
 		if err != nil {
 			return nil, err
 		}
-		// Call `opencode export` to get the transcript and write to temp file
-		transcriptPath, exportErr := a.fetchAndCacheExport(ctx, raw.SessionID)
-		if exportErr != nil {
-			return nil, fmt.Errorf("failed to export session: %w", exportErr)
+		// Export is deferred to PrepareTranscript; we just compute the path here.
+		transcriptPath, err := sessionTranscriptPath(ctx, raw.SessionID)
+		if err != nil {
+			return nil, err
 		}
 		return &agent.Event{
 			Type:       agent.TurnEnd,
@@ -141,6 +138,33 @@ func (a *OpenCodeAgent) PrepareTranscript(ctx context.Context, sessionRef string
 	return err
 }
 
+// sessionTranscriptPath validates the session ID and returns the expected transcript path.
+func sessionTranscriptPath(ctx context.Context, sessionID string) (string, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return "", err
+	}
+	repoRoot, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		repoRoot = "."
+	}
+	return filepath.Join(repoRoot, paths.EntireTmpDir, sessionID+".json"), nil
+}
+
+// validateSessionID checks that a session ID is safe for use in file paths.
+// Rejects empty strings, path separators, and traversal attempts.
+func validateSessionID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("invalid session ID: empty")
+	}
+	if strings.ContainsAny(id, "/\\") {
+		return fmt.Errorf("invalid session ID: contains path separator: %q", id)
+	}
+	if id != filepath.Base(id) {
+		return fmt.Errorf("invalid session ID: not a simple filename: %q", id)
+	}
+	return nil
+}
+
 // fetchAndCacheExport calls `opencode export <sessionID>` and writes the result
 // to a temporary file. Returns the path to the temp file.
 //
@@ -149,6 +173,10 @@ func (a *OpenCodeAgent) PrepareTranscript(ctx context.Context, sessionRef string
 // pre-write the transcript file to .entire/tmp/<sessionID>.json before
 // triggering the hook. See integration_test/hooks.go:SimulateOpenCodeTurnEnd.
 func (a *OpenCodeAgent) fetchAndCacheExport(ctx context.Context, sessionID string) (string, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return "", err
+	}
+
 	// Get worktree root for the temp directory
 	repoRoot, err := paths.WorktreeRoot(ctx)
 	if err != nil {

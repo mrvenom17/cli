@@ -167,6 +167,19 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	if transcriptRef == "" {
 		return errors.New("transcript file not specified")
 	}
+
+	// If agent implements TranscriptPreparer, materialize the transcript file.
+	// This must run BEFORE fileExists: agents like OpenCode lazily fetch transcripts
+	// via `opencode export`, so the file doesn't exist until PrepareTranscript creates it.
+	// Claude Code's PrepareTranscript just flushes (always succeeds). Agents without
+	// TranscriptPreparer (Gemini, Droid) are unaffected.
+	if preparer, ok := ag.(agent.TranscriptPreparer); ok {
+		if err := preparer.PrepareTranscript(ctx, transcriptRef); err != nil {
+			logging.Warn(logCtx, "failed to prepare transcript",
+				slog.String("error", err.Error()))
+		}
+	}
+
 	if !fileExists(transcriptRef) {
 		return fmt.Errorf("transcript file not found: %s", transcriptRef)
 	}
@@ -185,14 +198,6 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	}
 	if err := os.MkdirAll(sessionDirAbs, 0o750); err != nil {
 		return fmt.Errorf("failed to create session directory: %w", err)
-	}
-
-	// If agent implements TranscriptPreparer, wait for transcript to be ready
-	if preparer, ok := ag.(agent.TranscriptPreparer); ok {
-		if err := preparer.PrepareTranscript(ctx, transcriptRef); err != nil {
-			logging.Warn(logCtx, "failed to prepare transcript",
-				slog.String("error", err.Error()))
-		}
 	}
 
 	// Copy transcript to session directory
