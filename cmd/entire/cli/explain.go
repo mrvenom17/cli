@@ -1082,17 +1082,21 @@ func isShadowBranchReachable(ctx context.Context, repo *git.Repository, baseComm
 }
 
 // convertTemporaryCheckpoint converts a TemporaryCheckpointInfo to a RewindPoint.
-// Returns nil if the checkpoint should be skipped (no code changes or can't be read).
+// Returns nil if the checkpoint should be skipped (no tree changes or can't be read).
+//
+// Filtering uses hasAnyChanges (O(1) tree hash comparison) rather than hasCodeChanges
+// (O(files) full diff). This means metadata-only checkpoints (.entire/ changes without
+// code changes) are kept — only true no-ops (identical tree as parent) are dropped.
+// This trade-off is intentional for list-view performance.
 func convertTemporaryCheckpoint(repo *git.Repository, tc checkpoint.TemporaryCheckpointInfo) *strategy.RewindPoint {
 	shadowCommit, commitErr := repo.CommitObject(tc.CommitHash)
 	if commitErr != nil {
 		return nil
 	}
 
-	// Filter out checkpoints with no changes at all (tree unchanged from parent).
-	// Uses lightweight tree hash comparison instead of full diff (hasCodeChanges)
-	// to avoid slow go-git packfile resolution in list views.
-	// This may include metadata-only changes, which is acceptable for the list view.
+	// Skip no-op commits where the tree is identical to the parent's.
+	// Note: this keeps metadata-only changes (e.g. transcript updates in .entire/)
+	// since those produce a different tree hash. See hasAnyChanges godoc.
 	if !hasAnyChanges(shadowCommit) {
 		return nil
 	}
