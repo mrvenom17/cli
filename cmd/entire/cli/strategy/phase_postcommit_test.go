@@ -2154,9 +2154,9 @@ func TestPostCommit_NonEndedSession_NotMarkedFullyCondensed(t *testing.T) {
 //
 // This is a regression test for the bug where shouldCondenseWithOverlapCheck
 // incorrectly skipped condensation because filesTouchedBefore (from Turn 1)
-// didn't overlap with the committed files (from Turn 2). ACTIVE sessions should
-// always condense when hasNew is true — the overlap check is only meaningful
-// for IDLE/ENDED sessions.
+// didn't overlap with the committed files (from Turn 2). ACTIVE sessions with a
+// recent LastInteractionTime should condense when hasNew is true — the overlap
+// check is only meaningful for IDLE/ENDED sessions and stale ACTIVE sessions.
 func TestPostCommit_ActiveSession_DifferentFilesThanCommit_ShouldCondense(t *testing.T) {
 	dir := setupGitRepo(t)
 	t.Chdir(dir)
