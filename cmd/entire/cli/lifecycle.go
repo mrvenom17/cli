@@ -82,12 +82,16 @@ func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *age
 		message += fmt.Sprintf("\n  %d other active conversation(s) in this workspace will also be included.\n  Use 'entire status' for more information.", count)
 	}
 
-	// Output informational message
+	// Output informational message if the agent supports hook responses.
+	// Claude Code reads JSON from stdout; agents that don't implement
+	// HookResponseWriter silently skip (avoids raw JSON in their terminal).
 	if event.ResponseMessage != "" {
 		message = event.ResponseMessage
 	}
-	if err := outputHookResponse(message); err != nil {
-		return err
+	if writer, ok := ag.(agent.HookResponseWriter); ok {
+		if err := writer.WriteHookResponse(message); err != nil {
+			return fmt.Errorf("failed to write hook response: %w", err)
+		}
 	}
 
 	// Fire EventSessionStart for the current session (if state exists).
@@ -285,7 +289,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	if len(allPrompts) > 0 {
 		lastPrompt = allPrompts[len(allPrompts)-1]
 	}
-	commitMessage := generateCommitMessage(lastPrompt)
+	commitMessage := generateCommitMessage(lastPrompt, ag.Type())
 	logging.Debug(logCtx, "using commit message",
 		slog.Int("message_length", len(commitMessage)))
 
