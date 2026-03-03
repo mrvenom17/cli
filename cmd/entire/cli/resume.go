@@ -223,7 +223,11 @@ func resumeMultipleCheckpoints(ctx context.Context, repo *git.Repository, checkp
 	}
 
 	// Phase 2: Sort by CreatedAt ascending (oldest first → newest writes last and wins on disk)
-	sort.Slice(checkpoints, func(i, j int) bool {
+	sort.SliceStable(checkpoints, func(i, j int) bool {
+		if checkpoints[i].CreatedAt.Equal(checkpoints[j].CreatedAt) {
+			// Deterministic tie-breaker when CreatedAt timestamps are equal
+			return checkpoints[i].CheckpointID.String() < checkpoints[j].CheckpointID.String()
+		}
 		return checkpoints[i].CreatedAt.Before(checkpoints[j].CreatedAt)
 	})
 
