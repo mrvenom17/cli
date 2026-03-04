@@ -65,3 +65,35 @@ jobs:
           name: e2e-artifacts-${{ matrix.agent }}
           path: e2e/artifacts/
           retention-days: 7
+
+  notify-slack:
+    runs-on: ubuntu-latest
+    needs: [e2e-tests]
+    if: ${{ always() && needs.e2e-tests.result == 'failure' }}
+    steps:
+      - name: Notify Slack of E2E failure
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.E2E_SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":red_circle: *E2E Tests Failed* on `main`\n\nOne or more agents failed after merge.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run details>"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "Commit: `${{ github.sha }}` by ${{ github.actor }}"
+                    }
+                  ]
+                }
+              ]
+            }
