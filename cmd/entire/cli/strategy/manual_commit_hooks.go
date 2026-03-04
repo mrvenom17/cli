@@ -1450,6 +1450,11 @@ func (s *ManualCommitStrategy) hasNewTranscriptWork(ctx context.Context, state *
 
 	currentPos, err := analyzer.GetTranscriptPosition(state.TranscriptPath)
 	if err != nil {
+		logging.Debug(logCtx, "hasNewTranscriptWork: GetTranscriptPosition failed",
+			slog.String("session_id", state.SessionID),
+			slog.String("transcript_path", state.TranscriptPath),
+			slog.Any("error", err),
+		)
 		return false
 	}
 
