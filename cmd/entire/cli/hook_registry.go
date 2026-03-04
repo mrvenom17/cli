@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
@@ -16,6 +15,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
+	"github.com/entireio/cli/perf"
 
 	"github.com/spf13/cobra"
 )
@@ -106,8 +106,6 @@ func newAgentHookVerbCmdWithLogging(agentName types.AgentName, hookName string) 
 				return nil
 			}
 
-			start := time.Now()
-
 			// Initialize logging context with agent name
 			ctx := logging.WithAgent(logging.WithComponent(cmd.Context(), "hooks"), agentName)
 
@@ -115,6 +113,12 @@ func newAgentHookVerbCmdWithLogging(agentName types.AgentName, hookName string) 
 			strategyName := strategy.StrategyNameManualCommit
 
 			hookType := getHookType(hookName)
+
+			// Start root perf span — child spans in lifecycle handlers and strategy
+			// methods will automatically nest under this span.
+			ctx, span := perf.Start(ctx, hookName,
+				slog.String("hook_type", hookType))
+			defer span.End()
 
 			logging.Debug(ctx, "hook invoked",
 				slog.String("hook", hookName),
@@ -152,13 +156,6 @@ func newAgentHookVerbCmdWithLogging(agentName types.AgentName, hookName string) 
 				hookErr = handleClaudeCodePostTodo(ctx)
 			}
 			// Other pass-through hooks (nil event, no special handling) are no-ops
-
-			logging.LogDuration(ctx, slog.LevelDebug, "hook completed", start,
-				slog.String("hook", hookName),
-				slog.String("hook_type", hookType),
-				slog.String("strategy", strategyName),
-				slog.Bool("success", hookErr == nil),
-			)
 
 			return hookErr
 		},
