@@ -22,7 +22,20 @@ var (
 	_ agent.TranscriptPreparer     = (*ClaudeCodeAgent)(nil)
 	_ agent.TokenCalculator        = (*ClaudeCodeAgent)(nil)
 	_ agent.SubagentAwareExtractor = (*ClaudeCodeAgent)(nil)
+	_ agent.HookResponseWriter     = (*ClaudeCodeAgent)(nil)
 )
+
+// WriteHookResponse outputs a JSON hook response to stdout.
+// Claude Code reads this JSON and displays the systemMessage to the user.
+func (c *ClaudeCodeAgent) WriteHookResponse(message string) error {
+	resp := struct {
+		SystemMessage string `json:"systemMessage,omitempty"`
+	}{SystemMessage: message}
+	if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+		return fmt.Errorf("failed to encode hook response: %w", err)
+	}
+	return nil
+}
 
 // HookNames returns the hook verbs Claude Code supports.
 // These become subcommands: entire hooks claude-code <verb>
@@ -136,7 +149,7 @@ func (c *ClaudeCodeAgent) CalculateTokenUsage(transcriptData []byte, fromOffset 
 // --- Internal hook parsing functions ---
 
 func (c *ClaudeCodeAgent) parseSessionStart(stdin io.Reader) (*agent.Event, error) {
-	raw, err := agent.ReadAndParseHookInput[sessionInfoRaw](stdin)
+	raw, err := agent.ReadAndParseHookInput[sessionStartRaw](stdin)
 	if err != nil {
 		return nil, err
 	}
@@ -145,6 +158,7 @@ func (c *ClaudeCodeAgent) parseSessionStart(stdin io.Reader) (*agent.Event, erro
 		SessionID:  raw.SessionID,
 		SessionRef: raw.TranscriptPath,
 		Timestamp:  time.Now(),
+		Model:      raw.Model,
 	}, nil
 }
 
