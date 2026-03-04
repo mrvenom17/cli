@@ -1431,7 +1431,7 @@ func (s *ManualCommitStrategy) hasNewTranscriptWork(ctx context.Context, state *
 	// Only wait for flush when the session is active — for idle/ended sessions the
 	// transcript is already fully flushed (the Stop hook completed the flush).
 	if state.Phase.IsActive() {
-		if preparer, ok := ag.(agent.TranscriptPreparer); ok {
+		if preparer, ok := agent.AsTranscriptPreparer(ag); ok {
 			if prepErr := preparer.PrepareTranscript(ctx, state.TranscriptPath); prepErr != nil {
 				logging.Debug(logCtx, "prepare transcript failed",
 					slog.String("session_id", state.SessionID),
@@ -1443,7 +1443,7 @@ func (s *ManualCommitStrategy) hasNewTranscriptWork(ctx context.Context, state *
 		}
 	}
 
-	analyzer, ok := ag.(agent.TranscriptAnalyzer)
+	analyzer, ok := agent.AsTranscriptAnalyzer(ag)
 	if !ok {
 		return false
 	}
@@ -1488,7 +1488,23 @@ func (s *ManualCommitStrategy) extractModifiedFilesFromLiveTranscript(ctx contex
 		return nil
 	}
 
-	analyzer, ok := ag.(agent.TranscriptAnalyzer)
+	// Ensure transcript file is up-to-date (OpenCode creates/refreshes it via `opencode export`).
+	// Only wait for flush when the session is active — for idle/ended sessions the
+	// transcript is already fully flushed (the Stop hook completed the flush).
+	if state.Phase.IsActive() {
+		if preparer, ok := agent.AsTranscriptPreparer(ag); ok {
+			if prepErr := preparer.PrepareTranscript(ctx, state.TranscriptPath); prepErr != nil {
+				logging.Debug(logCtx, "prepare transcript failed",
+					slog.String("session_id", state.SessionID),
+					slog.String("agent_type", string(state.AgentType)),
+					slog.String("transcript_path", state.TranscriptPath),
+					slog.Any("error", prepErr),
+				)
+			}
+		}
+	}
+
+	analyzer, ok := agent.AsTranscriptAnalyzer(ag)
 	if !ok {
 		return nil
 	}
