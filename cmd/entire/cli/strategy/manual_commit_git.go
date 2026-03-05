@@ -111,6 +111,7 @@ func (s *ManualCommitStrategy) SaveStep(ctx context.Context, step StepContext) e
 		AuthorEmail:       step.AuthorEmail,
 		IsFirstCheckpoint: isFirstCheckpointOfSession,
 	})
+	writeCheckpointSpan.RecordError(err)
 	writeCheckpointSpan.End()
 	if err != nil {
 		return fmt.Errorf("failed to write temporary checkpoint: %w", err)

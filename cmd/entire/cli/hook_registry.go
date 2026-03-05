@@ -160,6 +160,7 @@ func executeAgentHook(cmd *cobra.Command, agentName types.AgentName, hookName st
 	}
 	// Other pass-through hooks (nil event, no special handling) are no-ops
 
+	span.RecordError(hookErr)
 	return hookErr
 }
 

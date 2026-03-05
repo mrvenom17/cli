@@ -102,6 +102,6 @@ func (s *Span) End() {
 func (s *Span) Measure(name string, fn func()) {
 	ctx := contextWithSpan(s.ctx, s)
 	_, child := Start(ctx, name)
+	defer child.End()
 	fn()
-	child.End()
 }
