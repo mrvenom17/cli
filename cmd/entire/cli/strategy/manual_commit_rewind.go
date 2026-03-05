@@ -196,7 +196,7 @@ func (s *ManualCommitStrategy) GetLogsOnlyRewindPoints(ctx context.Context, limi
 		}
 
 		// Resolve to the latest checkpoint by creation time (consistent with `entire resume`).
-		cpInfo, found := resolveLatestCheckpointFromMap(allCpIDs, checkpointInfoMap)
+		cpInfo, found := ResolveLatestCheckpointFromMap(allCpIDs, checkpointInfoMap)
 		if !found {
 			return nil
 		}
@@ -252,12 +252,10 @@ func (s *ManualCommitStrategy) GetLogsOnlyRewindPoints(ctx context.Context, limi
 	return points, nil
 }
 
-// resolveLatestCheckpointFromMap picks the checkpoint with the latest CreatedAt
+// ResolveLatestCheckpointFromMap picks the checkpoint with the latest CreatedAt
 // from a list of checkpoint IDs. Filters to IDs present in infoMap, then picks
-// the one with the most recent CreatedAt. The infoMap is populated by
-// listCheckpoints which already reads CreatedAt from the metadata tree, so no
-// additional tree I/O is needed here.
-func resolveLatestCheckpointFromMap(cpIDs []id.CheckpointID, infoMap map[id.CheckpointID]CheckpointInfo) (CheckpointInfo, bool) {
+// the one with the most recent CreatedAt.
+func ResolveLatestCheckpointFromMap(cpIDs []id.CheckpointID, infoMap map[id.CheckpointID]CheckpointInfo) (CheckpointInfo, bool) {
 	var found bool
 	var latest CheckpointInfo
 	for _, cpID := range cpIDs {
