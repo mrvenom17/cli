@@ -25,6 +25,8 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'failure' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.E2E_SLACK_WEBHOOK_URL }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -49,13 +51,13 @@ jobs:
           scripts/download-e2e-artifacts.sh "$WORKFLOW_RUN_ID"
 
       - name: Notify Slack - triage started
-        if: ${{ secrets.E2E_SLACK_WEBHOOK_URL != '' }}
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
         uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a
         env:
           RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, inputs.run_id) }}
           RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
         with:
-          webhook: ${{ secrets.E2E_SLACK_WEBHOOK_URL }}
+          webhook: ${{ env.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
             {
@@ -93,7 +95,7 @@ jobs:
              Print a summary table at the end."
 
       - name: Build Slack summary
-        if: ${{ always() && secrets.E2E_SLACK_WEBHOOK_URL != '' }}
+        if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
         env:
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
           WORKFLOW_RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, inputs.run_id) }}
@@ -120,9 +122,9 @@ jobs:
             > slack-payload.json
 
       - name: Notify Slack - triage complete
-        if: ${{ always() && secrets.E2E_SLACK_WEBHOOK_URL != '' }}
+        if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
         uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a
         with:
-          webhook: ${{ secrets.E2E_SLACK_WEBHOOK_URL }}
+          webhook: ${{ env.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload-file-path: slack-payload.json
