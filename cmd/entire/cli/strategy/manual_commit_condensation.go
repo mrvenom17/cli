@@ -145,7 +145,10 @@ func (s *ManualCommitStrategy) CondenseSession(ctx context.Context, repo *git.Re
 	// Some agents (e.g., Copilot CLI) write aggregate token data (session.shutdown)
 	// AFTER all hooks return, so state.TokenUsage from turn-end only has fallback data.
 	// By condensation time, the transcript has the authoritative totals.
-	if sessionData.TokenUsage != nil {
+	// Only replace when we got authoritative data (e.g., session.shutdown provides
+	// InputTokens; the fallback path only captures OutputTokens). This avoids
+	// overwriting accumulated multi-checkpoint totals with partial checkpoint data.
+	if sessionData.TokenUsage != nil && sessionData.TokenUsage.InputTokens > 0 {
 		state.TokenUsage = sessionData.TokenUsage
 	}
 
