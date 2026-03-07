@@ -157,12 +157,15 @@ func TestCollectPerfEntries(t *testing.T) {
 		}
 	})
 
-	t.Run("file not found", func(t *testing.T) {
+	t.Run("file not found returns empty", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := collectPerfEntries("/nonexistent/path/perf.jsonl", 10, "")
-		if err == nil {
-			t.Fatal("expected error for missing file, got nil")
+		entries, err := collectPerfEntries("/nonexistent/path/perf.jsonl", 10, "")
+		if err != nil {
+			t.Fatalf("expected nil error for missing file, got %v", err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("expected empty entries, got %d", len(entries))
 		}
 	})
 }

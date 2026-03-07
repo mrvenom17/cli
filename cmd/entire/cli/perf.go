@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -195,6 +196,9 @@ func parseSubStepKey(name string, allSteps map[string]int64) (string, int, bool)
 func collectPerfEntries(logFile string, last int, hookFilter string) ([]perfEntry, error) {
 	f, err := os.Open(logFile) //nolint:gosec // logFile is a CLI-resolved path, not user-supplied input
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("opening perf log: %w", err)
 	}
 	defer f.Close()
