@@ -1,22 +1,17 @@
----
-name: e2e-triage
-description: Triage E2E test failures — run locally with mise, classify flaky vs real bug. Presents findings and applies fixes in-place.
----
+# E2E Triage CI
 
-# E2E Triage
-
-Triage E2E test failures with **re-run verification**. Analyzes artifacts and re-runs failing tests locally to distinguish flaky from real bugs. Presents findings interactively and applies fixes directly in the working tree.
+Triage E2E test failures with **re-run verification**. Analyzes artifacts and re-runs failing tests locally to distinguish flaky from real bugs. Produces a findings report with classifications -- does NOT apply fixes.
 
 ---
 
 ## Step L1: Parse User Input
 
 The user provides one or more of:
-- **Test name(s)** — e.g., `TestInteractiveMultiStep`
-- **`--agent <agent>`** — optional, defaults to all agents that previously failed
-- **A local artifact path** — skip straight to analysis of existing artifacts
-- **CI run reference** — triggers artifact download instead of local re-runs:
-  - `latest CI run` / `latest` — most recent failed E2E run on main
+- **Test name(s)** -- e.g., `TestInteractiveMultiStep`
+- **`--agent <agent>`** -- optional, defaults to all agents that previously failed
+- **A local artifact path** -- skip straight to analysis of existing artifacts
+- **CI run reference** -- triggers artifact download instead of local re-runs:
+  - `latest CI run` / `latest` -- most recent failed E2E run on main
   - A GitHub Actions run ID (numeric, e.g., `12345678`)
   - A GitHub Actions run URL
 
@@ -26,7 +21,7 @@ The user provides one or more of:
 scripts/download-e2e-artifacts.sh <latest | RUN_ID | RUN_URL>
 ```
 
-The script outputs the absolute artifact path as its **last line of stdout** — capture that and use it as the artifact path for analysis. After downloading, **skip Steps L2–L5** (local re-runs) and go straight to **Shared Analysis** (Step 1), since we're analyzing CI artifacts, not running tests locally.
+The script outputs the absolute artifact path as its **last line of stdout** -- capture that and use it as the artifact path for analysis. After downloading, **skip Steps L2-L5** (local re-runs) and go straight to **Shared Analysis** (Step 1), since we're analyzing CI artifacts, not running tests locally.
 
 **Cost warning:** Real E2E tests consume API tokens. Before running, confirm with the user unless they provided specific test names (implying intent to run).
 
@@ -60,7 +55,7 @@ Proceed to **Shared Analysis** (Step 1 below).
 
 ### Step 1: Analyze Each Failure
 
-For each failure, follow the **Debugging Workflow** in `.claude/skills/debug-e2e/SKILL.md` (steps 2-5: console.log → test source → entire.log → deep dive). Collect:
+For each failure, follow the **Debugging Workflow** in `.claude/skills/e2e/debug.md` (steps 2-5: console.log -> test source -> entire.log -> deep dive). Collect:
 - What the agent actually did (from console.log)
 - What was expected (from test source)
 - CLI-level errors or anomalies (from entire.log)
@@ -74,15 +69,15 @@ Use **re-run results as the primary signal**, supplemented by artifact analysis.
 
 | Original | Re-run 1 | Re-run 2 | Classification |
 |----------|----------|----------|----------------|
-| FAIL | FAIL (same error) | FAIL (same error) | **real-bug** OR **flaky (test-bug)** — see below |
+| FAIL | FAIL (same error) | FAIL (same error) | **real-bug** OR **flaky (test-bug)** -- see below |
 | FAIL | PASS | PASS | **flaky** |
 | FAIL | PASS | FAIL | **flaky** (non-deterministic) |
 | FAIL | FAIL | PASS | **flaky** (non-deterministic) |
-| FAIL | FAIL (different error) | FAIL (different error) | **needs deeper analysis** — examine artifacts |
+| FAIL | FAIL (different error) | FAIL (different error) | **needs deeper analysis** -- examine artifacts |
 
 **Important: Consistent failures can still be `flaky` (test-bug).** When all re-runs fail, check *where* the root cause is:
-- Root cause in `cmd/entire/cli/` → **real-bug** (product code is broken)
-- Root cause in `e2e/` (test infra, test helpers, tmux setup, env propagation) → **flaky (test-bug)** — the CLI works fine, the test is broken
+- Root cause in `cmd/entire/cli/` -> **real-bug** (product code is broken)
+- Root cause in `e2e/` (test infra, test helpers, tmux setup, env propagation) -> **flaky (test-bug)** -- the CLI works fine, the test is broken
 
 #### Strong `real-bug` signals (root cause must be in `cmd/entire/cli/`, not `e2e/`):
 
@@ -108,8 +103,8 @@ Use **re-run results as the primary signal**, supplemented by artifact analysis.
 - Duration near timeout limit
 
 **Test-bug (consistent failure, but root cause is in `e2e/` not `cmd/entire/cli/`):**
-- Agent "Not logged in" / auth errors → test env setup doesn't propagate auth credentials
-- Env vars not propagated to agent session → tmux/test harness bug
+- Agent "Not logged in" / auth errors -> test env setup doesn't propagate auth credentials
+- Env vars not propagated to agent session -> tmux/test harness bug
 - Error references test code (`e2e/`) not CLI code (`cmd/entire/cli/`)
 - Test helper logic errors (wrong assertions, bad globs, incorrect expected values)
 - Consistent failure BUT root cause traced to `e2e/` code, not `cmd/entire/cli/`
@@ -123,21 +118,17 @@ Read `entire.log` carefully:
 
 ### Step 3: Cross-Agent Correlation
 
-Before acting, check correlations using re-run data:
+Before reporting, check correlations using re-run data:
 - Same test fails for 3+ agents, all re-runs also fail -> strong **real-bug**
 - Same test fails for multiple agents, but re-runs pass -> **flaky** (shared prompt issue)
 - One agent fails consistently, others pass -> agent-specific issue (still **real-bug** if re-runs confirm)
 
-### Step 4: Take Action
-
-Present findings interactively. **Do not** create branches, PRs, or GitHub issues.
-
-#### Present Findings Report
+### Step 4: Present Findings Report
 
 For each test+agent pair, print a findings block:
 
 ```
-## <TestName> (<agent>) — <classification>
+## <TestName> (<agent>) -- <classification>
 
 **Re-run results:** original=FAIL, rerun1=PASS, rerun2=PASS
 **Evidence:**
@@ -145,14 +136,12 @@ For each test+agent pair, print a findings block:
 - <key artifact evidence: entire.log excerpt, console.log excerpt, etc.>
 ```
 
-#### For `flaky` failures: describe the proposed fix
-
-For agent-behavior flaky issues, fixes typically modify test prompts. For test-bug flaky issues, fixes target `e2e/` infrastructure code (harness setup, helpers, env propagation).
+For `flaky` failures, include proposed fix description:
 
 ```
 **Proposed fix:** <description>
   - File: <path to test file or e2e infrastructure file>
-  - Change: <what will be modified — e.g., append "Do not ask for confirmation" to prompt, or fix env propagation in NewTmuxSession>
+  - Change: <what will be modified>
 ```
 
 Common flaky fixes:
@@ -165,7 +154,7 @@ Common flaky fixes:
 - Test helper bug (wrong assertion, bad glob) -> fix test helper in `e2e/`
 - tmux session setup issue -> fix `NewTmuxSession` or session config in `e2e/`
 
-#### For `real-bug` failures: describe root cause analysis
+For `real-bug` failures, include root cause analysis:
 
 ```
 **Root cause analysis:**
@@ -175,65 +164,13 @@ Common flaky fixes:
   - Proposed fix: <what code change would address it>
 ```
 
-#### Ask the user
-
-Prompt the user:
-
-> **Should I fix these?**
-> - [list of tests with classifications]
-> - You can select all, specific tests, or skip.
-
-Wait for user response before proceeding.
-
-#### Apply fixes (if user approves)
-
-For **flaky** fixes the user approved:
-1. Apply fixes directly in the working tree (no branch creation)
-2. Run static checks:
-   ```bash
-   mise run fmt && mise run lint
-   mise run test:e2e:canary   # Must pass
-   ```
-3. **Run real E2E tests to verify the fix.** Scope depends on what was changed:
-   - **Agent-specific fix** (e.g., `e2e/agents/cursor_cli.go`, one agent's config/trust/env): run the full suite for that agent only:
-     ```bash
-     mise run test:e2e --agent <agent>
-     ```
-   - **Shared test infra fix** (e.g., `e2e/agents/agent.go`, `e2e/testutil/`, `TmuxSession`, test helpers): run the full suite for all agents that failed, since the fix could affect any of them:
-     ```bash
-     mise run test:e2e --agent <agent1>
-     mise run test:e2e --agent <agent2>
-     # ... for each agent that had failures
-     ```
-   - **Test prompt fix** (e.g., changed wording in a specific test): run that test across all agents that failed it:
-     ```bash
-     mise run test:e2e --agent <agent> <TestName>
-     ```
-   This step is mandatory — canary tests use the Vogon fake agent and cannot verify agent-specific behavior (trust dialogs, env propagation, config directories, etc.).
-4. If any step fails, investigate and adjust. Report what happened to the user.
-
-For **real-bug** fixes the user approved:
-1. Apply the fix directly in the working tree (no branch creation)
-2. Run static checks and unit tests:
-   ```bash
-   mise run fmt && mise run lint
-   mise run test        # Unit tests
-   mise run test:e2e:canary  # Canary tests
-   ```
-3. **Run real E2E tests to verify the fix.** Same scoping rules as flaky fixes above:
-   - **Agent-specific change** → full suite for that agent
-   - **Shared CLI/infra change** → full suite for all agents that failed
-   - **Narrow change** (single test affected) → just that test across affected agents
-   Skip only if the user explicitly declines (cost concern).
-4. Report results to the user.
-
 ### Step 5: Summary
 
-Print a summary table:
+Print a summary table (classification only, no "Action Taken"):
 ```
-| Test | Agent(s) | Re-runs | Classification | Action Taken |
-|------|----------|---------|---------------|-------------|
-| TestFoo | claude-code | FAIL/PASS/PASS | flaky | Fixed in working tree |
-| TestBar | all agents | FAIL/FAIL/FAIL | real-bug | Fix applied, tests passing |
-| TestBaz | opencode | FAIL/PASS/FAIL | flaky | Skipped (user declined) |
+| Test | Agent(s) | Re-runs | Classification |
+|------|----------|---------|----------------|
+| TestFoo | claude-code | FAIL/PASS/PASS | flaky |
+| TestBar | all agents | FAIL/FAIL/FAIL | real-bug |
+| TestBaz | opencode | FAIL/PASS/FAIL | flaky (non-deterministic) |
 ```
