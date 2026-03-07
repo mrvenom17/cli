@@ -1,13 +1,13 @@
 # E2E Triage Skill
 
-Triage E2E test failures by re-running tests, classifying failures as flaky vs real-bug, and taking appropriate action (fixes in local mode, PRs/issues in CI mode).
+Triage E2E test failures by re-running tests, classifying failures as flaky vs real-bug, and taking appropriate action. Triggered manually via `workflow_dispatch` (no auto-trigger on E2E failures).
 
 ## Two Modes
 
 | Mode | Trigger | Action on flaky | Action on real-bug |
 |------|---------|----------------|--------------------|
 | **Local** | User invokes `/e2e-triage` | Presents findings, applies fixes in working tree | Presents root cause analysis, applies fix if approved |
-| **CI** | `WORKFLOW_RUN_ID` env var set (via `e2e-triage.yml`) | Creates batched PR | Creates or comments on GitHub issue |
+| **CI** | `workflow_dispatch` with run ID (via `e2e-triage.yml`) | Creates batched PR | Prints structured report to CI logs (no GitHub issues) |
 
 ## Local Usage
 
@@ -36,9 +36,9 @@ The skill will:
 
 ## CI Mode
 
-Triggered automatically by the `e2e-triage.yml` workflow. Downloads artifacts, re-runs failures via `e2e-isolated.yml`, then:
+Triggered manually via `workflow_dispatch` on the `e2e-triage.yml` workflow (use the "Triage" link in the Slack failure notification). Downloads artifacts, re-runs failures via `e2e-isolated.yml`, then:
 - **Flaky fixes** — batched into a single PR (`fix/e2e-flaky-<id>`)
-- **Real bugs** — filed as GitHub issues (with dedup check)
+- **Real bugs** — printed as structured reports in CI logs (no GitHub issues created)
 - **Summary** — writes `triage-summary.json` for Slack notifications
 
 ## Classification Logic

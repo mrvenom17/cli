@@ -1,11 +1,11 @@
 ---
 name: e2e-triage
-description: Triage E2E test failures — run locally with mise or via CI re-runs, classify flaky vs real bug. Local mode presents findings and applies fixes in-place; CI mode creates PRs for flaky fixes and GitHub issues for real bugs.
+description: Triage E2E test failures — run locally with mise or via CI re-runs, classify flaky vs real bug. Local mode presents findings and applies fixes in-place; CI mode creates PRs for flaky fixes and prints reports for real bugs.
 ---
 
 # E2E Triage
 
-Triage E2E test failures with **re-run verification**. Operates in two modes (auto-detected), analyzes artifacts, and re-runs failing tests to distinguish flaky from real bugs. **Local mode** presents findings interactively and applies fixes directly in the working tree. **CI mode** creates batched PRs for flaky fixes and GitHub issues for real bugs.
+Triage E2E test failures with **re-run verification**. Operates in two modes (auto-detected), analyzes artifacts, and re-runs failing tests to distinguish flaky from real bugs. **Local mode** presents findings interactively and applies fixes directly in the working tree. **CI mode** creates batched PRs for flaky fixes and prints structured reports for real bugs (no GitHub issues).
 
 ## Mode Detection
 
@@ -286,34 +286,42 @@ For **real-bug** fixes the user approved:
      --body "<structured body with per-test changes, re-run evidence, run link>"
    ```
 
-#### For `real-bug` failures: Issue (with dedup)
+#### For `real-bug` failures: CI Report
 
-1. **Search existing issues first:**
-   ```bash
-   gh issue list --search "is:open label:e2e <TestName>" --json number,title,url
-   ```
+Print a structured report to stdout (visible in CI logs / GitHub Actions step output). **Do NOT create GitHub issues or comments.**
 
-2. **If matching issue exists:** Add a comment with new evidence:
-   ```bash
-   gh issue comment <number> --body "<re-run results, verification details, run link, new evidence>"
-   ```
-   Note "Verified still failing — reproduced in N/N re-runs" plus any new diagnostic details.
+```
+══════════════════════════════════════════════════════
+REAL BUG REPORT: <TestName> (<agent(s)>)
+══════════════════════════════════════════════════════
 
-3. **If no matching issue:** Create new:
-   ```bash
-   gh issue create \
-     --title "E2E: <TestName> fails — <brief symptom>" \
-     --label "bug,e2e" \
-     --body "<structured body>"
-   ```
+Re-run results: original=FAIL, rerun1=FAIL, rerun2=FAIL
+CI run: <run URL>
 
-   Issue body includes:
-   - Test name, agent(s), CI run link (if available), re-run results
-   - Failure summary (expected vs actual)
-   - Root cause analysis (which CLI component: hooks, session, checkpoint, attribution, strategy)
-   - Key evidence: `entire.log` excerpts, `console.log` excerpts, git state
-   - Reproduction steps
-   - Suspected fix location (file, function, reason)
+FAILURE SUMMARY
+  Expected: <what should have happened>
+  Actual:   <what happened instead>
+
+ROOT CAUSE ANALYSIS
+  Component: <hooks | session | checkpoint | strategy | agent>
+  Location:  <file:function>
+  Description: <what's wrong and why>
+
+KEY EVIDENCE
+  entire.log: <relevant excerpts>
+  console.log: <relevant excerpts>
+  git state: <relevant details>
+
+REPRODUCTION STEPS
+  1. <step>
+  2. <step>
+
+SUSPECTED FIX
+  File: <path>
+  Function: <name>
+  Reason: <why this is the likely fix location>
+══════════════════════════════════════════════════════
+```
 
 ### Step 5: Summary Report
 
@@ -337,7 +345,7 @@ Print a summary table:
 | Test | Agent(s) | Re-runs | Classification | Action | Link |
 |------|----------|---------|---------------|--------|------|
 | TestFoo | claude-code | FAIL/PASS/PASS | flaky | PR #123 | url |
-| TestBar | all agents | FAIL/FAIL/FAIL | real-bug | Issue #456 (existing, commented) | url |
+| TestBar | all agents | FAIL/FAIL/FAIL | real-bug | Report (see CI logs) | — |
 | TestBaz | opencode | FAIL/PASS/FAIL | flaky | PR #123 | url |
 ```
 
@@ -354,8 +362,8 @@ cat > "${ARTIFACT_DIR}/triage-summary.json" << 'TEMPLATE'
       "agents": ["claude-code", "opencode"],
       "classification": "flaky|real-bug",
       "rerun_results": ["FAIL", "PASS", "PASS"],
-      "action_type": "pr|issue|comment",
-      "action_description": "PR #123|Issue #456 (new)|Issue #456 (commented)",
+      "action_type": "pr|report",
+      "action_description": "PR #123|Report (see CI logs)",
       "link": "https://github.com/entireio/cli/pull/123"
     }
   ]
