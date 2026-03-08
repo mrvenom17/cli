@@ -260,6 +260,10 @@ func updateCommand() string {
 		return "brew upgrade entire"
 	}
 
+	if strings.Contains(realPath, "/mise/") {
+		return "mise upgrade entire"
+	}
+
 	return "curl -fsSL https://entire.io/install.sh | bash"
 }
 

@@ -238,6 +238,7 @@ func TestUpdateCommand(t *testing.T) {
 
 	validCommands := map[string]bool{
 		"brew upgrade entire":                            true,
+		"mise upgrade entire":                            true,
 		"curl -fsSL https://entire.io/install.sh | bash": true,
 	}
 
