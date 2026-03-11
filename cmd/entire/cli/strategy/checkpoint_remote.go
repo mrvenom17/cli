@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -19,8 +20,14 @@ import (
 // checkpointRemoteName is the git remote name used for the dedicated checkpoint remote.
 const checkpointRemoteName = "entire-checkpoints"
 
-// checkpointRemoteFetchTimeout is the timeout for fetching branches from the remote.
+// checkpointRemoteFetchTimeout is the timeout for fetching branches from the checkpoint URL.
 const checkpointRemoteFetchTimeout = 30 * time.Second
+
+// Git remote protocol identifiers.
+const (
+	protocolSSH   = "ssh"
+	protocolHTTPS = "https"
+)
 
 // pushSettings holds the resolved push configuration from a single settings load.
 type pushSettings struct {
@@ -185,4 +192,135 @@ func fetchBranchIfMissing(ctx context.Context, remote, branchName string) error 
 		slog.String("remote", remote),
 	)
 	return nil
+}
+
+// gitRemoteInfo holds parsed components of a git remote URL.
+type gitRemoteInfo struct {
+	protocol string // "ssh" or "https"
+	host     string // e.g., "github.com"
+	owner    string // e.g., "org"
+	repo     string // e.g., "my-repo" (without .git)
+}
+
+// parseGitRemoteURL parses a git remote URL into its components.
+// Supports:
+//   - SSH SCP format: git@github.com:org/repo.git
+//   - HTTPS format: https://github.com/org/repo.git
+//   - SSH protocol format: ssh://git@github.com/org/repo.git
+func parseGitRemoteURL(rawURL string) (*gitRemoteInfo, error) {
+	rawURL = strings.TrimSpace(rawURL)
+
+	// SSH SCP format: git@github.com:org/repo.git
+	if strings.Contains(rawURL, ":") && !strings.Contains(rawURL, "://") {
+		// Split on the first ":"
+		parts := strings.SplitN(rawURL, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid SSH URL: %s", redactURL(rawURL))
+		}
+		hostPart := parts[0] // e.g., "git@github.com"
+		pathPart := parts[1] // e.g., "org/repo.git"
+
+		host := hostPart
+		if idx := strings.Index(host, "@"); idx >= 0 {
+			host = host[idx+1:]
+		}
+
+		owner, repo, err := splitOwnerRepo(pathPart)
+		if err != nil {
+			return nil, err
+		}
+
+		return &gitRemoteInfo{protocol: protocolSSH, host: host, owner: owner, repo: repo}, nil
+	}
+
+	// URL format: https://github.com/org/repo.git or ssh://git@github.com/org/repo.git
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %s", redactURL(rawURL))
+	}
+
+	protocol := u.Scheme
+	if protocol == "" {
+		return nil, fmt.Errorf("no protocol in URL: %s", redactURL(rawURL))
+	}
+	host := u.Hostname()
+
+	// Path is like /org/repo.git — trim leading slash
+	pathPart := strings.TrimPrefix(u.Path, "/")
+	owner, repo, err := splitOwnerRepo(pathPart)
+	if err != nil {
+		return nil, err
+	}
+
+	return &gitRemoteInfo{protocol: protocol, host: host, owner: owner, repo: repo}, nil
+}
+
+// splitOwnerRepo splits "org/repo.git" into owner and repo (without .git suffix).
+func splitOwnerRepo(path string) (string, string, error) {
+	path = strings.TrimSuffix(path, ".git")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("cannot parse owner/repo from path: %s", path)
+	}
+	return parts[0], parts[1], nil
+}
+
+// deriveCheckpointURL constructs a checkpoint remote URL using the same protocol
+// as the push remote. For example, if push remote uses SSH, the checkpoint URL
+// will also use SSH. The checkpointRepo is in "owner/repo" format.
+func deriveCheckpointURL(pushRemoteURL string, checkpointRepo string) (string, error) {
+	info, err := parseGitRemoteURL(pushRemoteURL)
+	if err != nil {
+		return "", fmt.Errorf("cannot parse push remote URL: %w", err)
+	}
+
+	switch info.protocol {
+	case protocolSSH:
+		// SCP format: git@host:owner/repo.git
+		return fmt.Sprintf("git@%s:%s.git", info.host, checkpointRepo), nil
+	case protocolHTTPS:
+		return fmt.Sprintf("https://%s/%s.git", info.host, checkpointRepo), nil
+	default:
+		return "", fmt.Errorf("unsupported protocol %q in push remote", info.protocol)
+	}
+}
+
+// extractOwnerFromRemoteURL extracts the owner from a git remote URL.
+// Returns empty string if the URL cannot be parsed.
+func extractOwnerFromRemoteURL(rawURL string) string {
+	info, err := parseGitRemoteURL(rawURL)
+	if err != nil {
+		return ""
+	}
+	return info.owner
+}
+
+// getRemoteURL returns the URL configured for a git remote.
+func getRemoteURL(ctx context.Context, remoteName string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "remote", "get-url", remoteName)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("remote %q not found", remoteName)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// redactURL removes credentials from a URL for safe logging.
+// Handles both HTTPS URLs with embedded credentials and general URLs.
+func redactURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		// For non-URL formats (SSH SCP), just return the host portion
+		if idx := strings.Index(rawURL, "@"); idx >= 0 {
+			if colonIdx := strings.Index(rawURL[idx:], ":"); colonIdx >= 0 {
+				return rawURL[idx+1:idx+colonIdx] + ":***"
+			}
+		}
+		return "<unparseable>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	host := u.Host
+	path := u.Path
+	return u.Scheme + "://" + host + path
 }
