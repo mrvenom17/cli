@@ -395,8 +395,9 @@ func FetchMetadataBranch(ctx context.Context) error {
 	return nil
 }
 
-// FetchMetadataTreeOnly fetches the entire/checkpoints/v1 branch from origin
-// with --filter=blob:none, downloading only commit and tree objects.
+// FetchMetadataTreeOnly fetches the tip of the entire/checkpoints/v1 branch
+// from origin with --depth=1 --filter=blob:none, downloading only the latest
+// commit and its tree objects (no blobs, no history).
 // After this call, tree navigation via go-git works but blob reads will fail
 // for objects that weren't previously fetched.
 // Uses git CLI for credential helper support.
@@ -408,7 +409,7 @@ func FetchMetadataTreeOnly(ctx context.Context) error {
 
 	refSpec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branchName, branchName)
 
-	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "--filter=blob:none", "origin", refSpec)
+	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "--depth=1", "--filter=blob:none", "origin", refSpec)
 	if output, err := fetchCmd.CombinedOutput(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return errors.New("treeless fetch timed out after 2 minutes")
