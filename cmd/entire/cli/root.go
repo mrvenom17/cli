@@ -72,7 +72,7 @@ func NewRootCmd() *cobra.Command {
 			ctx := cmd.Context()
 			// If we're in a git repo but Entire isn't set up yet, start the setup flow
 			if _, err := paths.WorktreeRoot(ctx); err == nil && !settings.IsSetUpAny(ctx) {
-				return runSetupFlow(ctx, cmd.OutOrStdout())
+				return runSetupFlow(ctx, cmd.OutOrStdout(), EnableOptions{})
 			}
 			return cmd.Help()
 		},
