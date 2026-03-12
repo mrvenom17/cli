@@ -683,7 +683,7 @@ func TestCheckRemoteMetadata_CheckpointNotOnRemote(t *testing.T) {
 	}
 }
 
-func TestResumeFromCurrentBranch_FallsBackToRemote(t *testing.T) {
+func TestResumeFromCurrentBranch_NoMetadataAvailable(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
 
@@ -697,20 +697,10 @@ func TestResumeFromCurrentBranch_FallsBackToRemote(t *testing.T) {
 	sessionID := "2025-01-01-test-session-uuid"
 	checkpointID := createCheckpointOnMetadataBranch(t, repo, sessionID)
 
-	// Copy the local entire/checkpoints/v1 to origin/entire/checkpoints/v1 (simulate remote)
-	localRef, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
-	if err != nil {
-		t.Fatalf("Failed to get local metadata branch: %v", err)
-	}
-	remoteRef := plumbing.NewHashReference(
-		plumbing.NewRemoteReferenceName("origin", paths.MetadataBranchName),
-		localRef.Hash(),
-	)
-	if err := repo.Storer.SetReference(remoteRef); err != nil {
-		t.Fatalf("Failed to create remote ref: %v", err)
-	}
-
-	// Delete local entire/checkpoints/v1 branch to simulate "not fetched yet"
+	// Delete local entire/checkpoints/v1 branch to simulate "not fetched yet".
+	// Don't create a remote ref — getMetadataTree falls back to
+	// GetRemoteMetadataBranchTree which reads refs/remotes/origin/... directly,
+	// so a remote ref would let it succeed without a real fetch.
 	if err := repo.Storer.RemoveReference(plumbing.NewBranchReferenceName(paths.MetadataBranchName)); err != nil {
 		t.Fatalf("Failed to remove local metadata branch: %v", err)
 	}
@@ -725,6 +715,7 @@ func TestResumeFromCurrentBranch_FallsBackToRemote(t *testing.T) {
 	}
 
 	commitMsg := "Add feature\n\nEntire-Checkpoint: " + checkpointID.String()
+	var err error
 	_, err = w.Commit(commitMsg, &git.CommitOptions{
 		Author: &object.Signature{
 			Name:  "Test User",
@@ -735,16 +726,11 @@ func TestResumeFromCurrentBranch_FallsBackToRemote(t *testing.T) {
 		t.Fatalf("Failed to create commit with checkpoint: %v", err)
 	}
 
-	// Run resumeFromCurrentBranch - should fall back to remote and attempt fetch
-	// In this test environment without a real origin remote, the fetch will fail
-	// but it should return a SilentError (user-friendly error message already printed)
+	// Run resumeFromCurrentBranch - metadata branch doesn't exist locally or on remote,
+	// so getMetadataTree fails and checkRemoteMetadata prints an informational message
+	// and returns nil (no remote branch to fetch from).
 	err = resumeFromCurrentBranch(context.Background(), "master", false)
-	if err == nil {
-		t.Error("resumeFromCurrentBranch() should return SilentError when fetch fails")
-	} else {
-		var silentErr *SilentError
-		if !errors.As(err, &silentErr) {
-			t.Errorf("resumeFromCurrentBranch() should return SilentError, got: %v", err)
-		}
+	if err != nil {
+		t.Errorf("resumeFromCurrentBranch() should return nil when no metadata available, got: %v", err)
 	}
 }
