@@ -2,16 +2,53 @@ package auth
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 
 	apiurl "github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/zalando/go-keyring"
 )
+
+func TestMain(m *testing.M) {
+	keyring.MockInit()
+	os.Exit(m.Run())
+}
+
+func TestStoreSaveAndGetToken(t *testing.T) {
+	t.Parallel()
+
+	store := NewStoreWithService("test-save-get")
+
+	if err := store.SaveToken("https://entire.io", "prod-token"); err != nil {
+		t.Fatalf("SaveToken() error = %v", err)
+	}
+
+	got, err := store.GetToken("https://entire.io")
+	if err != nil {
+		t.Fatalf("GetToken() error = %v", err)
+	}
+	if got != "prod-token" {
+		t.Fatalf("GetToken() = %q, want %q", got, "prod-token")
+	}
+}
+
+func TestStoreGetToken_NotFound(t *testing.T) {
+	t.Parallel()
+
+	store := NewStoreWithService("test-not-found")
+
+	got, err := store.GetToken("https://missing.example.com")
+	if err != nil {
+		t.Fatalf("GetToken() error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("GetToken() = %q, want empty string", got)
+	}
+}
 
 func TestStoreSaveToken_PreservesOtherBaseURLs(t *testing.T) {
 	t.Parallel()
 
-	store := NewStoreForPath(filepath.Join(t.TempDir(), "auth.json"))
+	store := NewStoreWithService("test-preserve")
 
 	if err := store.SaveToken("https://entire.io", "prod-token"); err != nil {
 		t.Fatalf("SaveToken(prod) error = %v", err)
@@ -21,58 +58,27 @@ func TestStoreSaveToken_PreservesOtherBaseURLs(t *testing.T) {
 		t.Fatalf("SaveToken(local) error = %v", err)
 	}
 
-	state, err := store.Load()
+	prod, err := store.GetToken("https://entire.io")
 	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+		t.Fatalf("GetToken(prod) error = %v", err)
+	}
+	if prod != "prod-token" {
+		t.Fatalf("prod token = %q, want %q", prod, "prod-token")
 	}
 
-	if got := state.Tokens["https://entire.io"].Value; got != "prod-token" {
-		t.Fatalf("prod token = %q, want %q", got, "prod-token")
-	}
-
-	if got := state.Tokens["http://localhost:8787"].Value; got != "local-token" {
-		t.Fatalf("local token = %q, want %q", got, "local-token")
-	}
-}
-
-func TestStoreSaveToken_WritesPrivateFile(t *testing.T) {
-	t.Parallel()
-
-	filePath := filepath.Join(t.TempDir(), "auth.json")
-	store := NewStoreForPath(filePath)
-
-	if err := store.SaveToken("https://entire.io", "prod-token"); err != nil {
-		t.Fatalf("SaveToken() error = %v", err)
-	}
-
-	info, err := os.Stat(filePath)
+	local, err := store.GetToken("http://localhost:8787")
 	if err != nil {
-		t.Fatalf("Stat() error = %v", err)
+		t.Fatalf("GetToken(local) error = %v", err)
 	}
-
-	if mode := info.Mode() & 0o777; mode != 0o600 {
-		t.Fatalf("auth file mode = %o, want 600", mode)
-	}
-}
-
-func TestLookupToken(t *testing.T) {
-	t.Setenv(apiurl.BaseURLEnvVar, "http://localhost:8787")
-
-	state := &File{
-		Tokens: map[string]Token{
-			"http://localhost:8787": {Value: "local-token"},
-		},
-	}
-
-	if got := LookupToken(state); got != "local-token" {
-		t.Fatalf("LookupToken() = %q, want %q", got, "local-token")
+	if local != "local-token" {
+		t.Fatalf("local token = %q, want %q", local, "local-token")
 	}
 }
 
 func TestStoreSaveToken_RejectsEmptyToken(t *testing.T) {
 	t.Parallel()
 
-	store := NewStoreForPath(filepath.Join(t.TempDir(), "auth.json"))
+	store := NewStoreWithService("test-empty")
 
 	if err := store.SaveToken("https://entire.io", ""); err == nil {
 		t.Fatal("SaveToken() with empty token should fail")
@@ -83,32 +89,51 @@ func TestStoreSaveToken_RejectsEmptyToken(t *testing.T) {
 	}
 }
 
-func TestStoreLoad_IgnoresUnknownFields(t *testing.T) {
+func TestStoreDeleteToken(t *testing.T) {
 	t.Parallel()
 
-	filePath := filepath.Join(t.TempDir(), "auth.json")
-	store := NewStoreForPath(filePath)
+	store := NewStoreWithService("test-delete")
 
-	contents := []byte(`{
-	  "tokens": {
-	    "https://entire.io": {
-	      "value": "prod-token",
-	      "created_at": "2026-03-13T00:00:00Z",
-	      "refresh_token": "ignored"
-	    }
-	  },
-	  "future_field": true
-	}`)
-	if err := os.WriteFile(filePath, contents, 0o600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
+	if err := store.SaveToken("https://entire.io", "tok"); err != nil {
+		t.Fatalf("SaveToken() error = %v", err)
 	}
 
-	state, err := store.Load()
+	if err := store.DeleteToken("https://entire.io"); err != nil {
+		t.Fatalf("DeleteToken() error = %v", err)
+	}
+
+	got, err := store.GetToken("https://entire.io")
 	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+		t.Fatalf("GetToken() error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("GetToken() after delete = %q, want empty", got)
+	}
+}
+
+func TestStoreDeleteToken_NotFoundIsNoop(t *testing.T) {
+	t.Parallel()
+
+	store := NewStoreWithService("test-delete-noop")
+
+	if err := store.DeleteToken("https://nonexistent.example.com"); err != nil {
+		t.Fatalf("DeleteToken() on missing key error = %v", err)
+	}
+}
+
+func TestLookupCurrentToken(t *testing.T) {
+	t.Setenv(apiurl.BaseURLEnvVar, "http://localhost:8787")
+
+	store := NewStore()
+	if err := store.SaveToken("http://localhost:8787", "local-token"); err != nil {
+		t.Fatalf("SaveToken() error = %v", err)
 	}
 
-	if got := state.Tokens["https://entire.io"].Value; got != "prod-token" {
-		t.Fatalf("token = %q, want %q", got, "prod-token")
+	got, err := LookupCurrentToken()
+	if err != nil {
+		t.Fatalf("LookupCurrentToken() error = %v", err)
+	}
+	if got != "local-token" {
+		t.Fatalf("LookupCurrentToken() = %q, want %q", got, "local-token")
 	}
 }

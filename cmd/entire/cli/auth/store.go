@@ -1,147 +1,73 @@
 package auth
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"time"
 
 	apiurl "github.com/entireio/cli/cmd/entire/cli/api"
-	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/zalando/go-keyring"
 )
 
-const authFileName = "auth.json"
+const keyringService = "entire-cli"
 
+// Store manages CLI authentication tokens in the OS keyring.
 type Store struct {
-	filePath string
+	service string
 }
 
-type File struct {
-	Tokens map[string]Token `json:"tokens,omitempty"`
+// NewStore returns a Store backed by the system keyring.
+func NewStore() *Store {
+	return &Store{service: keyringService}
 }
 
-type Token struct {
-	Value     string `json:"value"`
-	CreatedAt string `json:"created_at"`
+// NewStoreWithService returns a Store with a custom keyring service name (for testing).
+func NewStoreWithService(service string) *Store {
+	return &Store{service: service}
 }
 
-func NewStore() (*Store, error) {
-	filePath, err := defaultFilePath()
-	if err != nil {
-		return nil, err
-	}
-
-	return &Store{filePath: filePath}, nil
-}
-
-func NewStoreForPath(filePath string) *Store {
-	return &Store{filePath: filePath}
-}
-
-func (s *Store) FilePath() string {
-	return s.filePath
-}
-
+// SaveToken persists an access token for the given base URL.
 func (s *Store) SaveToken(baseURL, token string) error {
 	if strings.TrimSpace(token) == "" {
 		return errors.New("refusing to save empty token")
 	}
 
-	state, err := s.Load()
-	if err != nil {
-		return err
-	}
-
-	if state.Tokens == nil {
-		state.Tokens = make(map[string]Token)
-	}
-
-	state.Tokens[baseURL] = Token{
-		Value:     token,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-	}
-
-	return s.save(state)
-}
-
-func (s *Store) Load() (*File, error) {
-	data, err := os.ReadFile(s.filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &File{}, nil
-		}
-		return nil, fmt.Errorf("read auth file: %w", err)
-	}
-
-	var state File
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("parse auth file: %w", err)
-	}
-
-	return &state, nil
-}
-
-func defaultFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("get home directory: %w", err)
-	}
-
-	return filepath.Join(home, ".config", "entire", authFileName), nil
-}
-
-func (s *Store) save(state *File) error {
-	data, err := jsonutil.MarshalIndentWithNewline(state, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal auth file: %w", err)
-	}
-
-	dir := filepath.Dir(s.filePath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create auth directory: %w", err)
-	}
-
-	tmpPath := filepath.Join(dir, ".auth_tmp_"+strconv.FormatInt(time.Now().UnixNano(), 10))
-	tmpFile, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // path is internally constructed from s.filePath
-	if err != nil {
-		return fmt.Errorf("create temp auth file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close()
-		return fmt.Errorf("write temp auth file: %w", err)
-	}
-
-	if err := tmpFile.Sync(); err != nil {
-		_ = tmpFile.Close()
-		return fmt.Errorf("sync temp auth file: %w", err)
-	}
-
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("close temp auth file: %w", err)
-	}
-
-	if err := os.Rename(tmpFile.Name(), s.filePath); err != nil { //nolint:gosec // destination path is internally constructed or test-controlled
-		return fmt.Errorf("rename auth file: %w", err)
+	if err := keyring.Set(s.service, baseURL, token); err != nil {
+		return fmt.Errorf("save token to keyring: %w", err)
 	}
 
 	return nil
 }
 
-func LookupToken(state *File) string {
-	if state == nil || state.Tokens == nil {
-		return ""
+// GetToken retrieves a stored token for the given base URL.
+// Returns an empty string (and no error) if no token is stored.
+func (s *Store) GetToken(baseURL string) (string, error) {
+	token, err := keyring.Get(s.service, baseURL)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get token from keyring: %w", err)
 	}
 
-	entry, ok := state.Tokens[apiurl.BaseURL()]
-	if !ok {
-		return ""
+	return token, nil
+}
+
+// DeleteToken removes a stored token for the given base URL.
+func (s *Store) DeleteToken(baseURL string) error {
+	err := keyring.Delete(s.service, baseURL)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("delete token from keyring: %w", err)
 	}
 
-	return entry.Value
+	return nil
+}
+
+// LookupCurrentToken retrieves the token for the current base URL.
+func LookupCurrentToken() (string, error) {
+	store := NewStore()
+	return store.GetToken(apiurl.BaseURL())
 }

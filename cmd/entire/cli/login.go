@@ -79,17 +79,13 @@ func runLogin(ctx context.Context, outW, errW io.Writer, client deviceAuthClient
 		return fmt.Errorf("complete login: %w", err)
 	}
 
-	store, err := auth.NewStore()
-	if err != nil {
-		return fmt.Errorf("create auth store: %w", err)
-	}
+	store := auth.NewStore()
 
 	if err := store.SaveToken(client.BaseURL(), token); err != nil {
 		return fmt.Errorf("save auth token: %w", err)
 	}
 
 	fmt.Fprintln(outW, "Login complete.")
-	fmt.Fprintf(errW, "Token saved to %s\n", store.FilePath())
 	return nil
 }
 
