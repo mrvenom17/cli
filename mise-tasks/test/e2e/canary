@@ -36,6 +36,18 @@ go run ./e2e/cmd/testreport -color \
 
 # --- roger-roger: external agent tests only (binaries from mise) ---
 echo "--- canary: roger-roger ---"
+
+# Preflight: ensure required roger-roger binaries are on PATH so tests don't silently skip
+if ! command -v roger-roger >/dev/null 2>&1; then
+  echo "error: roger-roger binary not found on PATH; install/configure it before running roger-roger canary tests." >&2
+  exit 1
+fi
+
+if ! command -v entire-agent-roger-roger >/dev/null 2>&1; then
+  echo "error: entire-agent-roger-roger binary not found on PATH; install/configure it before running roger-roger canary tests." >&2
+  exit 1
+fi
+
 rr_filter="${filter:-TestExternalAgent}"
 E2E_AGENT=roger-roger gotestsum --format dots \
   --jsonfile "$E2E_ARTIFACT_DIR/test-events-roger-roger.json" -- \
