@@ -1,10 +1,14 @@
 package claudecode
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+
+	"github.com/entireio/cli/cmd/entire/cli/agent/testutil"
 )
 
 // metadataDenyRuleTest is the rule that blocks Claude from reading Entire metadata
@@ -15,7 +19,7 @@ func TestInstallHooks_PermissionsDeny_FreshInstall(t *testing.T) {
 	t.Chdir(tempDir)
 
 	agent := &ClaudeCodeAgent{}
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -23,7 +27,7 @@ func TestInstallHooks_PermissionsDeny_FreshInstall(t *testing.T) {
 	perms := readPermissions(t, tempDir)
 
 	// Verify permissions.deny contains our rule
-	if !containsDenyRule(perms.Deny, metadataDenyRuleTest) {
+	if !containsRule(perms.Deny, metadataDenyRuleTest) {
 		t.Errorf("permissions.deny = %v, want to contain %q", perms.Deny, metadataDenyRuleTest)
 	}
 }
@@ -34,13 +38,13 @@ func TestInstallHooks_PermissionsDeny_Idempotent(t *testing.T) {
 
 	agent := &ClaudeCodeAgent{}
 	// First install
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("first InstallHooks() error = %v", err)
 	}
 
 	// Second install
-	_, err = agent.InstallHooks(false, false)
+	_, err = agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("second InstallHooks() error = %v", err)
 	}
@@ -71,7 +75,7 @@ func TestInstallHooks_PermissionsDeny_PreservesUserRules(t *testing.T) {
 }`)
 
 	agent := &ClaudeCodeAgent{}
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -79,10 +83,10 @@ func TestInstallHooks_PermissionsDeny_PreservesUserRules(t *testing.T) {
 	perms := readPermissions(t, tempDir)
 
 	// Verify both rules exist
-	if !containsDenyRule(perms.Deny, "Bash(rm -rf *)") {
+	if !containsRule(perms.Deny, "Bash(rm -rf *)") {
 		t.Errorf("permissions.deny = %v, want to contain user rule", perms.Deny)
 	}
-	if !containsDenyRule(perms.Deny, metadataDenyRuleTest) {
+	if !containsRule(perms.Deny, metadataDenyRuleTest) {
 		t.Errorf("permissions.deny = %v, want to contain Entire rule", perms.Deny)
 	}
 }
@@ -99,7 +103,7 @@ func TestInstallHooks_PermissionsDeny_PreservesAllowRules(t *testing.T) {
 }`)
 
 	agent := &ClaudeCodeAgent{}
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -110,10 +114,10 @@ func TestInstallHooks_PermissionsDeny_PreservesAllowRules(t *testing.T) {
 	if len(perms.Allow) != 2 {
 		t.Errorf("permissions.allow = %v, want 2 rules", perms.Allow)
 	}
-	if !containsDenyRule(perms.Allow, "Read(**)") {
+	if !containsRule(perms.Allow, "Read(**)") {
 		t.Errorf("permissions.allow = %v, want to contain Read(**)", perms.Allow)
 	}
-	if !containsDenyRule(perms.Allow, "Write(**)") {
+	if !containsRule(perms.Allow, "Write(**)") {
 		t.Errorf("permissions.allow = %v, want to contain Write(**)", perms.Allow)
 	}
 }
@@ -130,7 +134,7 @@ func TestInstallHooks_PermissionsDeny_SkipsExistingRule(t *testing.T) {
 }`)
 
 	agent := &ClaudeCodeAgent{}
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -157,7 +161,7 @@ func TestInstallHooks_PermissionsDeny_PreservesUnknownFields(t *testing.T) {
 }`)
 
 	agent := &ClaudeCodeAgent{}
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -181,12 +185,12 @@ func TestInstallHooks_PermissionsDeny_PreservesUnknownFields(t *testing.T) {
 
 	// Verify "ask" field is preserved
 	if _, ok := rawPermissions["ask"]; !ok {
-		t.Errorf("permissions.ask was not preserved, got keys: %v", getKeys(rawPermissions))
+		t.Errorf("permissions.ask was not preserved, got keys: %v", testutil.GetKeys(rawPermissions))
 	}
 
 	// Verify "customField" is preserved
 	if _, ok := rawPermissions["customField"]; !ok {
-		t.Errorf("permissions.customField was not preserved, got keys: %v", getKeys(rawPermissions))
+		t.Errorf("permissions.customField was not preserved, got keys: %v", testutil.GetKeys(rawPermissions))
 	}
 
 	// Verify the "ask" field content
@@ -203,7 +207,7 @@ func TestInstallHooks_PermissionsDeny_PreservesUnknownFields(t *testing.T) {
 	if err := json.Unmarshal(rawPermissions["deny"], &denyRules); err != nil {
 		t.Fatalf("failed to parse permissions.deny: %v", err)
 	}
-	if !containsDenyRule(denyRules, metadataDenyRuleTest) {
+	if !containsRule(denyRules, metadataDenyRuleTest) {
 		t.Errorf("permissions.deny = %v, want to contain %q", denyRules, metadataDenyRuleTest)
 	}
 
@@ -259,21 +263,8 @@ func writeSettingsFile(t *testing.T, tempDir, content string) {
 	}
 }
 
-func containsDenyRule(rules []string, rule string) bool {
-	for _, r := range rules {
-		if r == rule {
-			return true
-		}
-	}
-	return false
-}
-
-func getKeys(m map[string]json.RawMessage) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
+func containsRule(rules []string, rule string) bool {
+	return slices.Contains(rules, rule)
 }
 
 func TestUninstallHooks(t *testing.T) {
@@ -283,24 +274,24 @@ func TestUninstallHooks(t *testing.T) {
 	agent := &ClaudeCodeAgent{}
 
 	// First install
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
 
 	// Verify hooks are installed
-	if !agent.AreHooksInstalled() {
+	if !agent.AreHooksInstalled(context.Background()) {
 		t.Error("hooks should be installed before uninstall")
 	}
 
 	// Uninstall
-	err = agent.UninstallHooks()
+	err = agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() error = %v", err)
 	}
 
 	// Verify hooks are removed
-	if agent.AreHooksInstalled() {
+	if agent.AreHooksInstalled(context.Background()) {
 		t.Error("hooks should not be installed after uninstall")
 	}
 }
@@ -312,7 +303,7 @@ func TestUninstallHooks_NoSettingsFile(t *testing.T) {
 	agent := &ClaudeCodeAgent{}
 
 	// Should not error when no settings file exists
-	err := agent.UninstallHooks()
+	err := agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() should not error when no settings file: %v", err)
 	}
@@ -339,7 +330,7 @@ func TestUninstallHooks_PreservesUserHooks(t *testing.T) {
 }`)
 
 	agent := &ClaudeCodeAgent{}
-	err := agent.UninstallHooks()
+	err := agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() error = %v", err)
 	}
@@ -366,26 +357,26 @@ func TestUninstallHooks_RemovesDenyRule(t *testing.T) {
 	agent := &ClaudeCodeAgent{}
 
 	// First install (which adds the deny rule)
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
 
 	// Verify deny rule was added
 	perms := readPermissions(t, tempDir)
-	if !containsDenyRule(perms.Deny, metadataDenyRuleTest) {
+	if !containsRule(perms.Deny, metadataDenyRuleTest) {
 		t.Fatal("deny rule should be present after install")
 	}
 
 	// Uninstall
-	err = agent.UninstallHooks()
+	err = agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() error = %v", err)
 	}
 
 	// Verify deny rule was removed
 	perms = readPermissions(t, tempDir)
-	if containsDenyRule(perms.Deny, metadataDenyRuleTest) {
+	if containsRule(perms.Deny, metadataDenyRuleTest) {
 		t.Error("deny rule should be removed after uninstall")
 	}
 }
@@ -409,7 +400,7 @@ func TestUninstallHooks_PreservesUserDenyRules(t *testing.T) {
 }`)
 
 	agent := &ClaudeCodeAgent{}
-	err := agent.UninstallHooks()
+	err := agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() error = %v", err)
 	}
@@ -417,12 +408,12 @@ func TestUninstallHooks_PreservesUserDenyRules(t *testing.T) {
 	perms := readPermissions(t, tempDir)
 
 	// Verify user deny rule is preserved
-	if !containsDenyRule(perms.Deny, "Bash(rm -rf *)") {
+	if !containsRule(perms.Deny, "Bash(rm -rf *)") {
 		t.Errorf("user deny rule was removed, got: %v", perms.Deny)
 	}
 
 	// Verify entire deny rule is removed
-	if containsDenyRule(perms.Deny, metadataDenyRuleTest) {
+	if containsRule(perms.Deny, metadataDenyRuleTest) {
 		t.Errorf("entire deny rule should be removed, got: %v", perms.Deny)
 	}
 }
@@ -441,4 +432,227 @@ func readClaudeSettings(t *testing.T, tempDir string) ClaudeSettings {
 		t.Fatalf("failed to parse settings.json: %v", err)
 	}
 	return settings
+}
+
+//nolint:tparallel // Parent uses t.Chdir() which prevents t.Parallel(); subtests only read from pre-loaded data
+func TestInstallHooks_PreservesUserHooksOnSameType(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	// Create settings with user hooks on the same hook types we use
+	writeSettingsFile(t, tempDir, `{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "echo user stop hook"}]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "echo user session start"}]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [{"type": "command", "command": "echo user wrote file"}]
+      }
+    ]
+  }
+}`)
+
+	agent := &ClaudeCodeAgent{}
+	_, err := agent.InstallHooks(context.Background(), false, false)
+	if err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+
+	rawHooks := testutil.ReadRawHooks(t, tempDir, ".claude")
+
+	t.Run("Stop", func(t *testing.T) {
+		t.Parallel()
+		var matchers []ClaudeHookMatcher
+		if err := json.Unmarshal(rawHooks["Stop"], &matchers); err != nil {
+			t.Fatalf("failed to parse Stop hooks: %v", err)
+		}
+		assertHookExists(t, matchers, "", "echo user stop hook", "user Stop hook")
+		assertHookExists(t, matchers, "", "entire hooks claude-code stop", "Entire Stop hook")
+	})
+
+	t.Run("SessionStart", func(t *testing.T) {
+		t.Parallel()
+		var matchers []ClaudeHookMatcher
+		if err := json.Unmarshal(rawHooks["SessionStart"], &matchers); err != nil {
+			t.Fatalf("failed to parse SessionStart hooks: %v", err)
+		}
+		assertHookExists(t, matchers, "", "echo user session start", "user SessionStart hook")
+		assertHookExists(t, matchers, "", "entire hooks claude-code session-start", "Entire SessionStart hook")
+	})
+
+	t.Run("PostToolUse", func(t *testing.T) {
+		t.Parallel()
+		var matchers []ClaudeHookMatcher
+		if err := json.Unmarshal(rawHooks["PostToolUse"], &matchers); err != nil {
+			t.Fatalf("failed to parse PostToolUse hooks: %v", err)
+		}
+		assertHookExists(t, matchers, "Write", "echo user wrote file", "user Write hook")
+		assertHookExists(t, matchers, "Task", "entire hooks claude-code post-task", "Entire Task hook")
+		assertHookExists(t, matchers, "TodoWrite", "entire hooks claude-code post-todo", "Entire TodoWrite hook")
+	})
+}
+
+// assertHookExists checks that a hook with the given matcher and command exists
+func assertHookExists(t *testing.T, matchers []ClaudeHookMatcher, matcher, command, description string) {
+	t.Helper()
+	for _, m := range matchers {
+		if m.Matcher == matcher {
+			for _, h := range m.Hooks {
+				if h.Command == command {
+					return
+				}
+			}
+		}
+	}
+	t.Errorf("%s was not found (matcher=%q, command=%q)", description, matcher, command)
+}
+
+func TestInstallHooks_PreservesUnknownHookTypes(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	// Create settings with a hook type we don't handle (Notification is a real Claude Code hook type)
+	writeSettingsFile(t, tempDir, `{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "echo notification received"}]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".*",
+        "hooks": [{"type": "command", "command": "echo subagent stopped"}]
+      }
+    ]
+  }
+}`)
+
+	agent := &ClaudeCodeAgent{}
+	_, err := agent.InstallHooks(context.Background(), false, false)
+	if err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+
+	// Read raw settings to check for unknown hook types
+	rawHooks := testutil.ReadRawHooks(t, tempDir, ".claude")
+
+	// Verify Notification hook is preserved
+	if _, ok := rawHooks["Notification"]; !ok {
+		t.Errorf("Notification hook type was not preserved, got keys: %v", testutil.GetKeys(rawHooks))
+	}
+
+	// Verify SubagentStop hook is preserved
+	if _, ok := rawHooks["SubagentStop"]; !ok {
+		t.Errorf("SubagentStop hook type was not preserved, got keys: %v", testutil.GetKeys(rawHooks))
+	}
+
+	// Verify the Notification hook content is intact
+	var notificationMatchers []ClaudeHookMatcher
+	if err := json.Unmarshal(rawHooks["Notification"], &notificationMatchers); err != nil {
+		t.Fatalf("failed to parse Notification hooks: %v", err)
+	}
+	if len(notificationMatchers) != 1 {
+		t.Errorf("Notification matchers = %d, want 1", len(notificationMatchers))
+	}
+	if len(notificationMatchers) > 0 && len(notificationMatchers[0].Hooks) > 0 {
+		if notificationMatchers[0].Hooks[0].Command != "echo notification received" {
+			t.Errorf("Notification hook command = %q, want %q",
+				notificationMatchers[0].Hooks[0].Command, "echo notification received")
+		}
+	}
+
+	// Verify the SubagentStop hook content is intact
+	var subagentStopMatchers []ClaudeHookMatcher
+	if err := json.Unmarshal(rawHooks["SubagentStop"], &subagentStopMatchers); err != nil {
+		t.Fatalf("failed to parse SubagentStop hooks: %v", err)
+	}
+	if len(subagentStopMatchers) != 1 {
+		t.Errorf("SubagentStop matchers = %d, want 1", len(subagentStopMatchers))
+	}
+	if len(subagentStopMatchers) > 0 {
+		if subagentStopMatchers[0].Matcher != ".*" {
+			t.Errorf("SubagentStop matcher = %q, want %q", subagentStopMatchers[0].Matcher, ".*")
+		}
+		if len(subagentStopMatchers[0].Hooks) > 0 {
+			if subagentStopMatchers[0].Hooks[0].Command != "echo subagent stopped" {
+				t.Errorf("SubagentStop hook command = %q, want %q",
+					subagentStopMatchers[0].Hooks[0].Command, "echo subagent stopped")
+			}
+		}
+	}
+
+	// Verify our hooks were also installed
+	if _, ok := rawHooks["Stop"]; !ok {
+		t.Errorf("Stop hook should have been installed")
+	}
+}
+
+func TestUninstallHooks_PreservesUnknownHookTypes(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	// Create settings with Entire hooks AND unknown hook types
+	writeSettingsFile(t, tempDir, `{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "entire hooks claude-code stop"}]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "echo notification received"}]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".*",
+        "hooks": [{"type": "command", "command": "echo subagent stopped"}]
+      }
+    ]
+  }
+}`)
+
+	agent := &ClaudeCodeAgent{}
+	err := agent.UninstallHooks(context.Background())
+	if err != nil {
+		t.Fatalf("UninstallHooks() error = %v", err)
+	}
+
+	// Read raw settings to check for unknown hook types
+	rawHooks := testutil.ReadRawHooks(t, tempDir, ".claude")
+
+	// Verify Notification hook is preserved
+	if _, ok := rawHooks["Notification"]; !ok {
+		t.Errorf("Notification hook type was not preserved, got keys: %v", testutil.GetKeys(rawHooks))
+	}
+
+	// Verify SubagentStop hook is preserved
+	if _, ok := rawHooks["SubagentStop"]; !ok {
+		t.Errorf("SubagentStop hook type was not preserved, got keys: %v", testutil.GetKeys(rawHooks))
+	}
+
+	// Verify our hooks were removed
+	if _, ok := rawHooks["Stop"]; ok {
+		// Check if there are any hooks left (should be empty after uninstall)
+		var stopMatchers []ClaudeHookMatcher
+		if err := json.Unmarshal(rawHooks["Stop"], &stopMatchers); err == nil && len(stopMatchers) > 0 {
+			t.Errorf("Stop hook should have been removed")
+		}
+	}
 }

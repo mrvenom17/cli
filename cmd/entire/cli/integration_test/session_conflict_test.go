@@ -10,12 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/entireio/cli/cmd/entire/cli/sessionid"
-	"github.com/entireio/cli/cmd/entire/cli/strategy"
-
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // TestSessionIDConflict_OrphanedBranchIsReset tests that starting a new session
@@ -32,7 +29,7 @@ func TestSessionIDConflict_OrphanedBranchIsReset(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	baseHead := env.GetHeadHash()
 	shadowBranch := env.GetShadowBranchNameForCommit(baseHead)
@@ -108,7 +105,7 @@ func TestSessionIDConflict_NoConflictWithSameSession(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	// Create a session and checkpoint
 	session := env.NewSession()
@@ -144,7 +141,7 @@ func TestSessionIDConflict_NoShadowBranch(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	baseHead := env.GetHeadHash()
 	shadowBranch := env.GetShadowBranchNameForCommit(baseHead)
@@ -176,7 +173,7 @@ func TestSessionIDConflict_ManuallyCreatedOrphanedBranch(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	baseHead := env.GetHeadHash()
 	shadowBranch := env.GetShadowBranchNameForCommit(baseHead)
@@ -234,12 +231,9 @@ func createOrphanedShadowBranch(t *testing.T, repoDir, branchName, sessionID str
 		t.Fatalf("Failed to get HEAD commit: %v", err)
 	}
 
-	// Create an Entire session ID with date prefix
-	entireSessionID := sessionid.EntireSessionID(sessionID)
-
 	// Create commit message with Entire-Session trailer
 	commitMsg := "Orphaned checkpoint\n\n" +
-		"Entire-Session: " + entireSessionID + "\n" +
+		"Entire-Session: " + sessionID + "\n" +
 		"Entire-Strategy: manual-commit\n"
 
 	// Create the commit
@@ -290,7 +284,7 @@ func TestSessionIDConflict_ShadowBranchWithoutTrailer(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	baseHead := env.GetHeadHash()
 	shadowBranch := env.GetShadowBranchNameForCommit(baseHead)
@@ -325,7 +319,7 @@ func TestSessionStart_InformationalMessage(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	// Create first session and save a checkpoint (so StepCount > 0)
 	session1 := env.NewSession()
@@ -347,7 +341,7 @@ func TestSessionStart_InformationalMessage(t *testing.T) {
 	if state1 == nil || state1.StepCount == 0 {
 		t.Fatal("Session 1 should have checkpoints")
 	}
-	t.Logf("Session 1 (%s) has %d checkpoint(s)", session1.EntireID, state1.StepCount)
+	t.Logf("Session 1 (%s) has %d checkpoint(s)", session1.ID, state1.StepCount)
 
 	// Start a second session (different session ID, same base commit)
 	session2 := env.NewSession()
@@ -422,7 +416,7 @@ func TestSessionStart_InformationalMessageNoConcurrentSessions(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	// Start a single session (no other sessions)
 	session1 := env.NewSession()

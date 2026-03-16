@@ -5,12 +5,12 @@ package integration
 import (
 	"bytes"
 	"encoding/json"
-	"os"
 	"os/exec"
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
 // TestShadowStrategy_MidSessionCommit_FromTranscript tests that when Claude commits
@@ -25,7 +25,7 @@ import (
 func TestShadowStrategy_MidSessionCommit_FromTranscript(t *testing.T) {
 	t.Parallel()
 
-	env := NewFeatureBranchEnv(t, strategy.StrategyNameManualCommit)
+	env := NewFeatureBranchEnv(t)
 
 	session := env.NewSession()
 
@@ -39,7 +39,7 @@ func TestShadowStrategy_MidSessionCommit_FromTranscript(t *testing.T) {
 	cmd := exec.Command(getTestBinary(), "hooks", "claude-code", "user-prompt-submit")
 	cmd.Dir = env.RepoDir
 	cmd.Stdin = bytes.NewReader(inputJSON)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(testutil.GitIsolatedEnv(),
 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+env.ClaudeProjectDir,
 	)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -71,7 +71,7 @@ func TestShadowStrategy_MidSessionCommit_FromTranscript(t *testing.T) {
 	shadowBranches := env.ListBranchesWithPrefix("entire/")
 	hasShadowBranch := false
 	for _, b := range shadowBranches {
-		if b != paths.MetadataBranchName {
+		if b != paths.MetadataBranchName && b != paths.TrailsBranchName {
 			hasShadowBranch = true
 			break
 		}
@@ -108,7 +108,7 @@ func TestShadowStrategy_MidSessionCommit_FromTranscript(t *testing.T) {
 func TestShadowStrategy_MidSessionCommit_NoTrailerWithoutTranscriptPath(t *testing.T) {
 	t.Parallel()
 
-	env := NewFeatureBranchEnv(t, strategy.StrategyNameManualCommit)
+	env := NewFeatureBranchEnv(t)
 
 	session := env.NewSession()
 
@@ -139,7 +139,7 @@ func TestShadowStrategy_MidSessionCommit_NoTrailerWithoutTranscriptPath(t *testi
 func TestShadowStrategy_MidSessionCommit_NoTrailerForUnrelatedFile(t *testing.T) {
 	t.Parallel()
 
-	env := NewFeatureBranchEnv(t, strategy.StrategyNameManualCommit)
+	env := NewFeatureBranchEnv(t)
 
 	session := env.NewSession()
 
@@ -152,7 +152,7 @@ func TestShadowStrategy_MidSessionCommit_NoTrailerForUnrelatedFile(t *testing.T)
 	cmd := exec.Command(getTestBinary(), "hooks", "claude-code", "user-prompt-submit")
 	cmd.Dir = env.RepoDir
 	cmd.Stdin = bytes.NewReader(inputJSON)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(testutil.GitIsolatedEnv(),
 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+env.ClaudeProjectDir,
 	)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -188,7 +188,7 @@ func TestShadowStrategy_MidSessionCommit_NoTrailerForUnrelatedFile(t *testing.T)
 func TestShadowStrategy_AgentCommit_AlwaysGetsTrailer(t *testing.T) {
 	t.Parallel()
 
-	env := NewFeatureBranchEnv(t, strategy.StrategyNameManualCommit)
+	env := NewFeatureBranchEnv(t)
 
 	session := env.NewSession()
 
@@ -209,4 +209,166 @@ func TestShadowStrategy_AgentCommit_AlwaysGetsTrailer(t *testing.T) {
 	} else {
 		t.Logf("Agent commit correctly got checkpoint trailer: %s", checkpointID)
 	}
+}
+
+// TestShadowStrategy_MidSessionCommit_FilesTouchedFallback tests that when
+// FilesTouched is empty in session state (mid-session commit before SaveStep),
+// the fallback to committedFiles works correctly and the checkpoint metadata
+// contains the files that were actually committed.
+//
+// This is scenario 1 from the fix: when FilesTouched was originally empty,
+// fallback should assign committedFiles to files_touched.
+func TestShadowStrategy_MidSessionCommit_FilesTouchedFallback(t *testing.T) {
+	t.Parallel()
+
+	env := NewFeatureBranchEnv(t)
+
+	session := env.NewSession()
+
+	// Simulate user prompt with transcript path (initializes session with empty FilesTouched)
+	input := map[string]string{
+		"session_id":      session.ID,
+		"transcript_path": session.TranscriptPath,
+	}
+	inputJSON, _ := json.Marshal(input)
+	cmd := exec.Command(getTestBinary(), "hooks", "claude-code", "user-prompt-submit")
+	cmd.Dir = env.RepoDir
+	cmd.Stdin = bytes.NewReader(inputJSON)
+	cmd.Env = append(testutil.GitIsolatedEnv(),
+		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+env.ClaudeProjectDir,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("user-prompt-submit failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify session state has empty FilesTouched (no SaveStep has been called)
+	state, err := env.GetSessionState(session.ID)
+	if err != nil {
+		t.Fatalf("Failed to get session state: %v", err)
+	}
+	if state == nil {
+		t.Fatal("Session state is nil")
+	}
+	if len(state.FilesTouched) != 0 {
+		t.Errorf("Session state FilesTouched should be empty before SaveStep, got: %v", state.FilesTouched)
+	}
+
+	// Create a file as if Claude wrote it
+	env.WriteFile("mid_session_file.txt", "content from Claude mid-session")
+
+	// Create transcript showing Claude created the file (NO Stop called, NO SaveStep called)
+	session.CreateTranscript("Create a file for testing fallback", []FileChange{
+		{Path: "mid_session_file.txt", Content: "content from Claude mid-session"},
+	})
+
+	// Commit mid-session - FilesTouched in session state is still empty
+	// The fallback should assign committedFiles to files_touched in the checkpoint metadata
+	env.GitCommitWithShadowHooks("Mid-session commit testing fallback", "mid_session_file.txt")
+
+	// Get the checkpoint ID from the commit
+	commitHash := env.GetHeadHash()
+	checkpointID := env.GetCheckpointIDFromCommitMessage(commitHash)
+	if checkpointID == "" {
+		t.Fatal("Mid-session commit should have Entire-Checkpoint trailer")
+	}
+	t.Logf("Mid-session commit has checkpoint ID: %s", checkpointID)
+
+	// CRITICAL: Validate that the checkpoint metadata has the correct files_touched
+	// This verifies the fallback logic: when FilesTouched was empty, it should
+	// have been populated with the committed files.
+	env.ValidateCheckpoint(CheckpointValidation{
+		CheckpointID: checkpointID,
+		SessionID:    session.ID,
+		Strategy:     strategy.StrategyNameManualCommit,
+		FilesTouched: []string{"mid_session_file.txt"},
+	})
+
+	t.Log("FilesTouched fallback worked correctly: checkpoint metadata contains the committed file")
+}
+
+// TestShadowStrategy_MidTurnCommit_DifferentFilesThanCheckpoint tests that when
+// an agent's Turn 1 touches file A (saved via Stop/checkpoint), and Turn 2 commits
+// different files B and C, the PostCommit hook still condenses the session data
+// to entire/checkpoints/v1.
+//
+// This is a regression test for the bug where shouldCondenseWithOverlapCheck
+// incorrectly skipped condensation for ACTIVE sessions because filesTouchedBefore
+// (from Turn 1) didn't overlap with the committed files (from Turn 2).
+func TestShadowStrategy_MidTurnCommit_DifferentFilesThanCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	env := NewFeatureBranchEnv(t)
+
+	sess := env.NewSession()
+
+	// --- Turn 1: Start session, create a cache file, save checkpoint via Stop ---
+	if err := env.SimulateUserPromptSubmit(sess.ID); err != nil {
+		t.Fatalf("user-prompt-submit failed: %v", err)
+	}
+
+	// Agent creates a cache file in Turn 1
+	env.WriteFile("cache.db", "cache data from turn 1")
+	sess.CreateTranscript("Analyze data and create cache", []FileChange{
+		{Path: "cache.db", Content: "cache data from turn 1"},
+	})
+
+	// Stop fires (saves checkpoint with cache.db as touched file)
+	if err := env.SimulateStop(sess.ID, sess.TranscriptPath); err != nil {
+		t.Fatalf("SimulateStop failed: %v", err)
+	}
+
+	// Verify session is IDLE with cache.db as touched file
+	state, err := env.GetSessionState(sess.ID)
+	if err != nil {
+		t.Fatalf("GetSessionState failed: %v", err)
+	}
+	if state == nil {
+		t.Fatal("Session state is nil after Stop")
+	}
+	t.Logf("After Turn 1 stop: phase=%s, filesTouched=%v, stepCount=%d",
+		state.Phase, state.FilesTouched, state.StepCount)
+
+	// --- Turn 2: Reactivate session, modify DIFFERENT files, commit them ---
+	if err := env.SimulateUserPromptSubmit(sess.ID); err != nil {
+		t.Fatalf("user-prompt-submit (turn 2) failed: %v", err)
+	}
+
+	// Verify session is now ACTIVE again
+	state, err = env.GetSessionState(sess.ID)
+	if err != nil {
+		t.Fatalf("GetSessionState failed: %v", err)
+	}
+	if state.Phase != "active" {
+		t.Fatalf("Expected ACTIVE after Turn 2 start, got %s", state.Phase)
+	}
+
+	// Agent creates different files in Turn 2 (NOT cache.db)
+	env.WriteFile("README.md", "# Project\nGenerated by agent")
+	env.WriteFile("main.py", "print('hello')")
+
+	// Agent commits the different files mid-turn (no Stop before commit)
+	env.GitCommitWithShadowHooksAsAgent("Add project files", "README.md", "main.py")
+
+	// --- Verify: checkpoint was condensed despite different files ---
+	commitHash := env.GetHeadHash()
+	checkpointID := env.GetCheckpointIDFromCommitMessage(commitHash)
+
+	if checkpointID == "" {
+		t.Fatal("Commit should have Entire-Checkpoint trailer")
+	}
+	t.Logf("Mid-turn commit has checkpoint ID: %s", checkpointID)
+
+	// The critical assertion: entire/checkpoints/v1 branch should exist with data
+	if !env.BranchExists(paths.MetadataBranchName) {
+		t.Fatal("entire/checkpoints/v1 branch should exist — ACTIVE session with different files must still condense")
+	}
+
+	// Validate checkpoint data was written correctly
+	env.ValidateCheckpoint(CheckpointValidation{
+		CheckpointID: checkpointID,
+		SessionID:    sess.ID,
+		Strategy:     strategy.StrategyNameManualCommit,
+	})
+
+	t.Log("Mid-turn commit with different files correctly condensed to entire/checkpoints/v1")
 }

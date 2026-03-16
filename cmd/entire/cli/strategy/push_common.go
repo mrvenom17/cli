@@ -4,32 +4,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
-	"github.com/entireio/cli/cmd/entire/cli/settings"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
-// pushSessionsBranchCommon is the shared implementation for pushing session branches.
-// Used by both manual-commit and auto-commit strategies.
-// By default, session logs are pushed automatically alongside user pushes.
-// Configuration (stored in .entire/settings.json under strategy_options.push_sessions):
-//   - false: disable automatic pushing
-//   - true or not set: push automatically (default)
-func pushSessionsBranchCommon(remote, branchName string) error {
-	// Check if pushing is disabled
-	if isPushSessionsDisabled() {
-		return nil
-	}
-
-	repo, err := OpenRepository()
+// pushBranchIfNeeded pushes a branch to the given target if it has unpushed changes.
+// The target can be a remote name (e.g., "origin") or a URL for direct push.
+// When pushing to a URL, the "has unpushed" optimization is skipped since there are
+// no remote tracking refs — git itself handles the no-op case.
+// Does not check any settings — callers are responsible for gating.
+func pushBranchIfNeeded(ctx context.Context, target, branchName string) error {
+	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return nil //nolint:nilerr // Hook must be silent on failure
 	}
@@ -42,13 +37,13 @@ func pushSessionsBranchCommon(remote, branchName string) error {
 		return nil //nolint:nilerr // Expected when no sessions exist yet
 	}
 
-	// Check if there's actually something to push (local differs from remote)
-	if !hasUnpushedSessionsCommon(repo, remote, localRef.Hash(), branchName) {
-		// Nothing to push - skip silently
+	// Only check remote tracking refs when target is a remote name (not a URL).
+	// URLs don't have tracking refs, so we always attempt the push and let git handle it.
+	if !isURL(target) && !hasUnpushedSessionsCommon(repo, target, localRef.Hash(), branchName) {
 		return nil
 	}
 
-	return doPushSessionsBranch(remote, branchName)
+	return doPushBranch(ctx, target, branchName)
 }
 
 // hasUnpushedSessionsCommon checks if the local branch differs from the remote.
@@ -67,44 +62,64 @@ func hasUnpushedSessionsCommon(repo *git.Repository, remote string, localHash pl
 	return localHash != remoteRef.Hash()
 }
 
-// isPushSessionsDisabled checks if push_sessions is disabled in settings.
-// Returns true if push_sessions is explicitly set to false.
-func isPushSessionsDisabled() bool {
-	s, err := settings.Load()
-	if err != nil {
-		return false // Default: push is enabled
+// doPushBranch pushes the given branch to the target with fetch+merge recovery.
+// The target can be a remote name or a URL.
+func doPushBranch(ctx context.Context, target, branchName string) error {
+	displayTarget := target
+	if isURL(target) {
+		displayTarget = "checkpoint remote"
 	}
-	return s.IsPushSessionsDisabled()
-}
 
-// doPushSessionsBranch pushes the sessions branch to the remote.
-func doPushSessionsBranch(remote, branchName string) error {
-	fmt.Fprintf(os.Stderr, "[entire] Pushing session logs to %s...\n", remote)
+	fmt.Fprintf(os.Stderr, "[entire] Pushing %s to %s...", branchName, displayTarget)
+	stop := startProgressDots(os.Stderr)
 
 	// Try pushing first
-	if err := tryPushSessionsCommon(remote, branchName); err == nil {
+	if err := tryPushSessionsCommon(ctx, target, branchName); err == nil {
+		stop(" done")
 		return nil
 	}
+	stop("")
 
 	// Push failed - likely non-fast-forward. Try to fetch and merge.
-	fmt.Fprintf(os.Stderr, "[entire] Syncing with remote session logs...\n")
+	fmt.Fprintf(os.Stderr, "[entire] Syncing %s with remote...", branchName)
+	stop = startProgressDots(os.Stderr)
 
-	if err := fetchAndMergeSessionsCommon(remote, branchName); err != nil {
-		fmt.Fprintf(os.Stderr, "[entire] Warning: couldn't sync sessions: %v\n", err)
+	if err := fetchAndMergeSessionsCommon(ctx, target, branchName); err != nil {
+		stop("")
+		fmt.Fprintf(os.Stderr, "[entire] Warning: couldn't sync %s: %v\n", branchName, err)
+		printCheckpointRemoteHint(target)
 		return nil // Don't fail the main push
 	}
+	stop(" done")
 
 	// Try pushing again after merge
-	if err := tryPushSessionsCommon(remote, branchName); err != nil {
-		fmt.Fprintf(os.Stderr, "[entire] Warning: failed to push sessions after sync: %v\n", err)
+	fmt.Fprintf(os.Stderr, "[entire] Pushing %s to %s...", branchName, displayTarget)
+	stop = startProgressDots(os.Stderr)
+
+	if err := tryPushSessionsCommon(ctx, target, branchName); err != nil {
+		stop("")
+		fmt.Fprintf(os.Stderr, "[entire] Warning: failed to push %s after sync: %v\n", branchName, err)
+		printCheckpointRemoteHint(target)
+	} else {
+		stop(" done")
 	}
 
 	return nil
 }
 
+// printCheckpointRemoteHint prints a hint when a push to a checkpoint URL fails.
+// Only prints when the target is a URL (not the user's default remote).
+func printCheckpointRemoteHint(target string) {
+	if !isURL(target) {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "[entire] A checkpoint remote is configured in Entire settings (.entire/settings.json or .entire/settings.local.json) but could not be reached.")
+	fmt.Fprintln(os.Stderr, "[entire] Checkpoints are saved locally but not synced. Ensure you have access to the checkpoint remote.")
+}
+
 // tryPushSessionsCommon attempts to push the sessions branch.
-func tryPushSessionsCommon(remote, branchName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func tryPushSessionsCommon(ctx context.Context, remote, branchName string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
 	// Use --no-verify to prevent recursive hook calls
@@ -125,23 +140,47 @@ func tryPushSessionsCommon(remote, branchName string) error {
 
 // fetchAndMergeSessionsCommon fetches remote sessions and merges into local using go-git.
 // Since session logs are append-only (unique cond-* directories), we just combine trees.
-func fetchAndMergeSessionsCommon(remote, branchName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+// The target can be a remote name or a URL.
+func fetchAndMergeSessionsCommon(ctx context.Context, target, branchName string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
+	// Determine fetch refspec. When target is a URL, use a temp ref;
+	// when it's a remote name, use the standard remote-tracking ref.
+	var fetchedRefName plumbing.ReferenceName
+	var refSpec string
+	if isURL(target) {
+		tmpRef := "refs/entire-fetch-tmp/" + branchName
+		refSpec = fmt.Sprintf("+refs/heads/%s:%s", branchName, tmpRef)
+		fetchedRefName = plumbing.ReferenceName(tmpRef)
+	} else {
+		refSpec = fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", branchName, target, branchName)
+		fetchedRefName = plumbing.NewRemoteReferenceName(target, branchName)
+	}
+
 	// Use git CLI for fetch (go-git's fetch can be tricky with auth)
-	fetchCmd := exec.CommandContext(ctx, "git", "fetch", remote, branchName)
+	fetchCmd := exec.CommandContext(ctx, "git", "fetch", target, refSpec)
 	fetchCmd.Stdin = nil
 	if output, err := fetchCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("fetch failed: %s", output)
 	}
 
-	repo, err := OpenRepository()
+	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to open git repository: %w", err)
 	}
 
-	// Get local branch
+	// Reconcile disconnected metadata branches before merging trees.
+	// The fetch above updated the remote-tracking ref, so reconciliation
+	// can compare fresh local vs remote. If disconnected (empty-orphan bug),
+	// this cherry-picks local commits onto remote tip, updating the local ref.
+	// If reconciliation fails, abort — proceeding to tree merge on disconnected
+	// branches would silently combine unrelated histories.
+	if reconcileErr := ReconcileDisconnectedMetadataBranch(ctx, repo, os.Stderr); reconcileErr != nil {
+		return fmt.Errorf("metadata reconciliation failed: %w", reconcileErr)
+	}
+
+	// Get local branch (re-read after potential reconciliation update)
 	localRef, err := repo.Reference(plumbing.NewBranchReferenceName(branchName), true)
 	if err != nil {
 		return fmt.Errorf("failed to get local ref: %w", err)
@@ -155,12 +194,12 @@ func fetchAndMergeSessionsCommon(remote, branchName string) error {
 		return fmt.Errorf("failed to get local tree: %w", err)
 	}
 
-	// Get remote (FETCH_HEAD)
-	fetchHeadRef, err := repo.Reference(plumbing.ReferenceName("FETCH_HEAD"), true)
+	// Get fetched ref (remote-tracking or temp ref, updated by the fetch above)
+	remoteRef, err := repo.Reference(fetchedRefName, true)
 	if err != nil {
-		return fmt.Errorf("failed to get FETCH_HEAD: %w", err)
+		return fmt.Errorf("failed to get remote ref: %w", err)
 	}
-	remoteCommit, err := repo.CommitObject(fetchHeadRef.Hash())
+	remoteCommit, err := repo.CommitObject(remoteRef.Hash())
 	if err != nil {
 		return fmt.Errorf("failed to get remote commit: %w", err)
 	}
@@ -187,7 +226,7 @@ func fetchAndMergeSessionsCommon(remote, branchName string) error {
 
 	// Create merge commit with both parents
 	mergeCommitHash, err := createMergeCommitCommon(repo, mergedTreeHash,
-		[]plumbing.Hash{localRef.Hash(), fetchHeadRef.Hash()},
+		[]plumbing.Hash{localRef.Hash(), remoteRef.Hash()},
 		"Merge remote session logs")
 	if err != nil {
 		return fmt.Errorf("failed to create merge commit: %w", err)
@@ -199,7 +238,48 @@ func fetchAndMergeSessionsCommon(remote, branchName string) error {
 		return fmt.Errorf("failed to update branch ref: %w", err)
 	}
 
+	// Clean up temp ref if we used one (best-effort, not critical if it fails)
+	if isURL(target) {
+		_ = repo.Storer.RemoveReference(fetchedRefName) //nolint:errcheck // cleanup is best-effort
+	}
+
 	return nil
+}
+
+// startProgressDots prints dots to w every second until the returned stop function
+// is called. The stop function prints the given suffix and a newline.
+func startProgressDots(w io.Writer) func(suffix string) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				fmt.Fprint(w, ".")
+			}
+		}
+	}()
+	return func(suffix string) {
+		close(done)
+		<-stopped // Wait for goroutine to finish before writing suffix
+		fmt.Fprintln(w, suffix)
+	}
+}
+
+// isURL returns true if the target looks like a URL rather than a git remote name.
+func isURL(target string) bool {
+	return strings.Contains(target, "://") || strings.Contains(target, "@")
+}
+
+// PushTrailsBranch pushes the entire/trails/v1 branch to the remote.
+// Trails are always pushed regardless of the push_sessions setting.
+func PushTrailsBranch(ctx context.Context, remote string) error {
+	return pushBranchIfNeeded(ctx, remote, paths.TrailsBranchName)
 }
 
 // createMergeCommitCommon creates a merge commit with multiple parents.

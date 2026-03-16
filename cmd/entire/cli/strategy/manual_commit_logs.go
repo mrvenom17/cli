@@ -1,31 +1,29 @@
 package strategy
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"sort"
 	"strings"
 
-	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 // GetTaskCheckpoint retrieves a task checkpoint.
-func (s *ManualCommitStrategy) GetTaskCheckpoint(point RewindPoint) (*TaskCheckpoint, error) {
-	return getTaskCheckpointFromTree(point)
+func (s *ManualCommitStrategy) GetTaskCheckpoint(ctx context.Context, point RewindPoint) (*TaskCheckpoint, error) {
+	return getTaskCheckpointFromTree(ctx, point)
 }
 
 // GetTaskCheckpointTranscript retrieves the transcript for a task checkpoint.
-func (s *ManualCommitStrategy) GetTaskCheckpointTranscript(point RewindPoint) ([]byte, error) {
-	return getTaskTranscriptFromTree(point)
+func (s *ManualCommitStrategy) GetTaskCheckpointTranscript(ctx context.Context, point RewindPoint) ([]byte, error) {
+	return getTaskTranscriptFromTree(ctx, point)
 }
 
 // GetSessionInfo returns the current session info.
-func (s *ManualCommitStrategy) GetSessionInfo() (*SessionInfo, error) {
-	repo, err := OpenRepository()
+func (s *ManualCommitStrategy) GetSessionInfo(ctx context.Context) (*SessionInfo, error) {
+	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open git repository: %w", err)
 	}
@@ -44,7 +42,7 @@ func (s *ManualCommitStrategy) GetSessionInfo() (*SessionInfo, error) {
 	}
 
 	// Find sessions for current HEAD
-	sessions, err := s.findSessionsForCommit(head.Hash().String())
+	sessions, err := s.findSessionsForCommit(ctx, head.Hash().String())
 	if err != nil || len(sessions) == 0 {
 		return nil, ErrNoSession
 	}
@@ -68,7 +66,7 @@ func (s *ManualCommitStrategy) GetSessionInfo() (*SessionInfo, error) {
 
 // GetMetadataRef returns a reference to the metadata for the given checkpoint.
 // For manual-commit strategy, returns the sharded path on entire/checkpoints/v1 branch.
-func (s *ManualCommitStrategy) GetMetadataRef(checkpoint Checkpoint) string {
+func (s *ManualCommitStrategy) GetMetadataRef(_ context.Context, checkpoint Checkpoint) string {
 	if checkpoint.CheckpointID.IsEmpty() {
 		return ""
 	}
@@ -77,8 +75,8 @@ func (s *ManualCommitStrategy) GetMetadataRef(checkpoint Checkpoint) string {
 
 // GetSessionMetadataRef returns a reference to the most recent metadata commit for a session.
 // For manual-commit strategy, metadata lives on the entire/checkpoints/v1 branch.
-func (s *ManualCommitStrategy) GetSessionMetadataRef(_ string) string {
-	repo, err := OpenRepository()
+func (s *ManualCommitStrategy) GetSessionMetadataRef(ctx context.Context, _ string) string {
+	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return ""
 	}
@@ -95,107 +93,19 @@ func (s *ManualCommitStrategy) GetSessionMetadataRef(_ string) string {
 	return trailers.FormatSourceRef(paths.MetadataBranchName, ref.Hash().String())
 }
 
-// GetSessionContext returns the context.md content for a session.
-// For manual-commit strategy, reads from the entire/checkpoints/v1 branch using the sessions map.
-func (s *ManualCommitStrategy) GetSessionContext(sessionID string) string {
-	// Find a checkpoint for this session
-	checkpoints, err := s.getCheckpointsForSession(sessionID)
-	if err != nil || len(checkpoints) == 0 {
-		return ""
-	}
-
-	// Use the most recent checkpoint
-	sort.Slice(checkpoints, func(i, j int) bool {
-		return checkpoints[i].CreatedAt.After(checkpoints[j].CreatedAt)
-	})
-	checkpointID := checkpoints[0].CheckpointID
-
-	repo, err := OpenRepository()
-	if err != nil {
-		return ""
-	}
-
-	// Get the sessions branch
-	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
-	ref, err := repo.Reference(refName, true)
-	if err != nil {
-		return ""
-	}
-
-	commit, err := repo.CommitObject(ref.Hash())
-	if err != nil {
-		return ""
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		return ""
-	}
-
-	// Get checkpoint tree to read the sessions summary
-	checkpointTree, err := tree.Tree(checkpointID.Path())
-	if err != nil {
-		return ""
-	}
-
-	// Read root metadata to find session's context path from sessions map
-	metadataFile, err := checkpointTree.File(paths.MetadataFileName)
-	if err != nil {
-		return ""
-	}
-
-	metadataContent, err := metadataFile.Contents()
-	if err != nil {
-		return ""
-	}
-
-	var summary checkpoint.CheckpointSummary
-	if err := json.Unmarshal([]byte(metadataContent), &summary); err != nil {
-		return ""
-	}
-
-	// Look up context path from sessions array
-	// Try to find the session by reading each session's metadata, or fall back to latest
-	var sessionPaths checkpoint.SessionFilePaths
-	if len(summary.Sessions) > 0 {
-		// Use the latest session by default (last entry in the array)
-		latestIndex := len(summary.Sessions) - 1
-		sessionPaths = summary.Sessions[latestIndex]
-	} else {
-		return ""
-	}
-
-	// Read context using absolute path from root tree
-	// SessionFilePaths now contains absolute paths like "/a1/b2c3d4e5f6/1/context.md"
-	if sessionPaths.Context == "" {
-		return ""
-	}
-	// Strip leading "/" for tree.File() which expects paths without leading slash
-	contextPath := strings.TrimPrefix(sessionPaths.Context, "/")
-	file, err := tree.File(contextPath)
-	if err != nil {
-		return ""
-	}
-	content, err := file.Contents()
-	if err != nil {
-		return ""
-	}
-	return content
-}
-
 // GetCheckpointLog returns the session transcript for a specific checkpoint.
 // For manual-commit strategy, metadata is stored at sharded paths on entire/checkpoints/v1 branch.
-func (s *ManualCommitStrategy) GetCheckpointLog(checkpoint Checkpoint) ([]byte, error) {
+func (s *ManualCommitStrategy) GetCheckpointLog(ctx context.Context, checkpoint Checkpoint) ([]byte, error) { //nolint:unparam // []byte is used by callers; lint false positive from test-only usage
 	if checkpoint.CheckpointID.IsEmpty() {
 		return nil, ErrNoMetadata
 	}
-	return s.getCheckpointLog(checkpoint.CheckpointID)
+	return s.getCheckpointLog(ctx, checkpoint.CheckpointID)
 }
 
 // GetAdditionalSessions implements SessionSource interface.
 // Returns active sessions from .git/entire-sessions/ that haven't yet been condensed.
-func (s *ManualCommitStrategy) GetAdditionalSessions() ([]*Session, error) {
-	activeStates, err := s.listAllSessionStates()
+func (s *ManualCommitStrategy) GetAdditionalSessions(ctx context.Context) ([]*Session, error) {
+	activeStates, err := s.listAllSessionStates(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list session states: %w", err)
 	}
@@ -214,7 +124,7 @@ func (s *ManualCommitStrategy) GetAdditionalSessions() ([]*Session, error) {
 		}
 
 		// Try to get description from shadow branch
-		if description := s.getDescriptionFromShadowBranch(state.SessionID, state.BaseCommit, state.WorktreeID); description != "" {
+		if description := s.getDescriptionFromShadowBranch(ctx, state.SessionID, state.BaseCommit, state.WorktreeID); description != "" {
 			session.Description = description
 		}
 
@@ -226,8 +136,8 @@ func (s *ManualCommitStrategy) GetAdditionalSessions() ([]*Session, error) {
 
 // getDescriptionFromShadowBranch reads the session description from the shadow branch.
 // sessionID is expected to be an Entire session ID (already date-prefixed like "2026-01-12-abc123").
-func (s *ManualCommitStrategy) getDescriptionFromShadowBranch(sessionID, baseCommit, worktreeID string) string {
-	repo, err := OpenRepository()
+func (s *ManualCommitStrategy) getDescriptionFromShadowBranch(ctx context.Context, sessionID, baseCommit, worktreeID string) string {
+	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return ""
 	}
@@ -253,6 +163,3 @@ func (s *ManualCommitStrategy) getDescriptionFromShadowBranch(sessionID, baseCom
 	metadataDir := paths.SessionMetadataDirFromSessionID(sessionID)
 	return getSessionDescriptionFromTree(tree, metadataDir)
 }
-
-// Compile-time check that ManualCommitStrategy implements SessionSource
-var _ SessionSource = (*ManualCommitStrategy)(nil)

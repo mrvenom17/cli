@@ -1,12 +1,13 @@
 package strategy
 
 import (
+	"context"
 	"sort"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/storage/memory"
 )
 
 const testThreeLines = "line1\nline2\nline3\n"
@@ -278,7 +279,8 @@ func TestCalculateAttributionWithAccumulated_BasicCase(t *testing.T) {
 	promptAttributions := []PromptAttribution{} // No intermediate checkpoints
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -336,7 +338,8 @@ func TestCalculateAttributionWithAccumulated_BugScenario(t *testing.T) {
 	promptAttributions := []PromptAttribution{} // No intermediate checkpoints
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -394,7 +397,8 @@ func TestCalculateAttributionWithAccumulated_DeletionOnly(t *testing.T) {
 	promptAttributions := []PromptAttribution{} // No intermediate checkpoints
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -444,7 +448,8 @@ func TestCalculateAttributionWithAccumulated_NoUserEdits(t *testing.T) {
 	promptAttributions := []PromptAttribution{} // No intermediate checkpoints
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -497,7 +502,8 @@ func TestCalculateAttributionWithAccumulated_NoAgentWork(t *testing.T) {
 	promptAttributions := []PromptAttribution{} // No intermediate checkpoints
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -552,7 +558,8 @@ func TestCalculateAttributionWithAccumulated_UserRemovesAllAgentLines(t *testing
 	promptAttributions := []PromptAttribution{} // No intermediate checkpoints
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -622,7 +629,8 @@ func TestCalculateAttributionWithAccumulated_WithPromptAttributions(t *testing.T
 	}
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -666,7 +674,8 @@ func TestCalculateAttributionWithAccumulated_EmptyFilesTouched(t *testing.T) {
 	headTree := buildTestTree(t, map[string]string{})
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, []string{}, []PromptAttribution{},
+		context.Background(),
+		baseTree, shadowTree, headTree, []string{}, []PromptAttribution{}, "", "", "",
 	)
 
 	if result != nil {
@@ -719,7 +728,8 @@ func TestCalculateAttributionWithAccumulated_UserEditsNonAgentFile(t *testing.T)
 	}
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -763,62 +773,67 @@ func TestCalculateAttributionWithAccumulated_UserEditsNonAgentFile(t *testing.T)
 	}
 }
 
-// TestGetAllChangedFilesBetweenTrees tests the hash-based file change detection.
-func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
+// newTestTreeBuilder creates an independent in-memory storage and returns a
+// createTree helper that is safe to use from a single goroutine.
+//
+//nolint:errcheck // Test helper - errors would cause test failures anyway
+func newTestTreeBuilder() func(files map[string]string) *object.Tree {
 	storer := memory.NewStorage()
-
-	// Helper to create a blob and return its hash
-	//nolint:errcheck // Test helper - errors would cause test failures anyway
-	createBlob := func(content string) plumbing.Hash {
-		blob := storer.NewEncodedObject()
-		blob.SetType(plumbing.BlobObject)
-		writer, _ := blob.Writer()
-		_, _ = writer.Write([]byte(content))
-		_ = writer.Close()
-		hash, _ := storer.SetEncodedObject(blob)
-		return hash
-	}
-
-	// Helper to create a tree from file entries
-	//nolint:errcheck // Test helper - errors would cause test failures anyway
-	createTree := func(files map[string]string) *object.Tree {
+	return func(files map[string]string) *object.Tree {
 		var entries []object.TreeEntry
 		for name, content := range files {
+			blob := storer.NewEncodedObject()
+			blob.SetType(plumbing.BlobObject)
+			writer, _ := blob.Writer()
+			_, _ = writer.Write([]byte(content))
+			_ = writer.Close()
+			hash, _ := storer.SetEncodedObject(blob)
 			entries = append(entries, object.TreeEntry{
 				Name: name,
 				Mode: 0o100644,
-				Hash: createBlob(content),
+				Hash: hash,
 			})
 		}
-		// Sort entries by name (git requirement)
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].Name < entries[j].Name
 		})
-
 		tree := &object.Tree{Entries: entries}
 		treeObj := storer.NewEncodedObject()
 		_ = tree.Encode(treeObj)
-		hash, _ := storer.SetEncodedObject(treeObj)
-
-		// Re-decode to get proper Tree object with hash
-		decodedTree, _ := object.GetTree(storer, hash)
+		treeHash, _ := storer.SetEncodedObject(treeObj)
+		decodedTree, _ := object.GetTree(storer, treeHash)
 		return decodedTree
 	}
+}
+
+// TestGetAllChangedFilesBetweenTreesSlow tests the go-git tree walk fallback
+// used by CondenseSessionByID (doctor command) when commit hashes are unavailable.
+func TestGetAllChangedFilesBetweenTreesSlow(t *testing.T) {
+	t.Parallel()
 
 	t.Run("both trees nil", func(t *testing.T) {
-		result := getAllChangedFilesBetweenTrees(nil, nil)
+		t.Parallel()
+		result, err := getAllChangedFilesBetweenTreesSlow(context.Background(), nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if result != nil {
 			t.Errorf("expected nil, got %v", result)
 		}
 	})
 
 	t.Run("tree1 nil (all files added)", func(t *testing.T) {
+		t.Parallel()
+		createTree := newTestTreeBuilder()
 		tree2 := createTree(map[string]string{
 			testFile1:  "content1",
 			"file2.go": "content2",
 		})
 
-		result := getAllChangedFilesBetweenTrees(nil, tree2)
+		result, err := getAllChangedFilesBetweenTreesSlow(context.Background(), nil, tree2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		sort.Strings(result)
 
 		if len(result) != 2 {
@@ -830,11 +845,16 @@ func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
 	})
 
 	t.Run("tree2 nil (all files deleted)", func(t *testing.T) {
+		t.Parallel()
+		createTree := newTestTreeBuilder()
 		tree1 := createTree(map[string]string{
 			testFile1: "content1",
 		})
 
-		result := getAllChangedFilesBetweenTrees(tree1, nil)
+		result, err := getAllChangedFilesBetweenTreesSlow(context.Background(), tree1, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		if len(result) != 1 || result[0] != testFile1 {
 			t.Errorf("expected [file1.go], got %v", result)
@@ -842,6 +862,8 @@ func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
 	})
 
 	t.Run("identical trees (no changes)", func(t *testing.T) {
+		t.Parallel()
+		createTree := newTestTreeBuilder()
 		tree1 := createTree(map[string]string{
 			testFile1:  "same content",
 			"file2.go": "also same",
@@ -851,7 +873,10 @@ func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
 			"file2.go": "also same",
 		})
 
-		result := getAllChangedFilesBetweenTrees(tree1, tree2)
+		result, err := getAllChangedFilesBetweenTreesSlow(context.Background(), tree1, tree2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		if len(result) != 0 {
 			t.Errorf("expected no changes, got %v", result)
@@ -859,6 +884,8 @@ func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
 	})
 
 	t.Run("one file modified", func(t *testing.T) {
+		t.Parallel()
+		createTree := newTestTreeBuilder()
 		tree1 := createTree(map[string]string{
 			testFile1:      "original",
 			"unchanged.go": "stays same",
@@ -868,7 +895,10 @@ func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
 			"unchanged.go": "stays same",
 		})
 
-		result := getAllChangedFilesBetweenTrees(tree1, tree2)
+		result, err := getAllChangedFilesBetweenTreesSlow(context.Background(), tree1, tree2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		if len(result) != 1 || result[0] != testFile1 {
 			t.Errorf("expected [file1.go], got %v", result)
@@ -876,6 +906,8 @@ func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
 	})
 
 	t.Run("file added and deleted", func(t *testing.T) {
+		t.Parallel()
+		createTree := newTestTreeBuilder()
 		tree1 := createTree(map[string]string{
 			"deleted.go": "will be removed",
 			"stays.go":   "unchanged",
@@ -885,7 +917,10 @@ func TestGetAllChangedFilesBetweenTrees(t *testing.T) {
 			"stays.go": "unchanged",
 		})
 
-		result := getAllChangedFilesBetweenTrees(tree1, tree2)
+		result, err := getAllChangedFilesBetweenTreesSlow(context.Background(), tree1, tree2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		sort.Strings(result)
 
 		if len(result) != 2 {
@@ -1000,7 +1035,8 @@ func TestCalculateAttributionWithAccumulated_UserSelfModification(t *testing.T) 
 	}
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -1072,7 +1108,8 @@ func TestCalculateAttributionWithAccumulated_MixedModifications(t *testing.T) {
 	}
 
 	result := CalculateAttributionWithAccumulated(
-		baseTree, shadowTree, headTree, filesTouched, promptAttributions,
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
 	)
 
 	if result == nil {
@@ -1108,6 +1145,78 @@ func TestCalculateAttributionWithAccumulated_MixedModifications(t *testing.T) {
 	}
 	if result.AgentPercentage < 61.4 || result.AgentPercentage > 61.6 {
 		t.Errorf("AgentPercentage = %.1f%%, want ~61.5%%", result.AgentPercentage)
+	}
+}
+
+// TestCalculateAttributionWithAccumulated_UncommittedWorktreeFiles tests the bug where
+// files in the worktree but NOT in the commit inflate the attribution calculation.
+//
+// Bug scenario:
+// 1. Agent creates docs/example.md (17 lines)
+// 2. .claude/settings.json (84 lines) exists in worktree from agent setup
+// 3. calculatePromptAttributionAtStart captures .claude/settings.json as user change
+// 4. User commits only docs/example.md (git add docs/ && git commit)
+// 5. BUG: accumulatedUserAdded=84 inflates totalUserAdded and totalCommitted
+// 6. Result: agentPercentage = 17/101 = 16.8% instead of 100%
+func TestCalculateAttributionWithAccumulated_UncommittedWorktreeFiles(t *testing.T) {
+	t.Parallel()
+
+	// Base: empty tree (initial --allow-empty commit)
+	baseTree := buildTestTree(t, nil)
+
+	// Shadow (agent checkpoint): agent created example.md
+	agentContent := "# Software Testing\n\nSoftware testing is a critical part of the development process.\n\n## Types of Testing\n\n- Unit testing\n- Integration testing\n- End-to-end testing\n\n## Best Practices\n\nWrite tests early.\nAutomate where possible.\nTest edge cases.\nReview test coverage.\n"
+	shadowTree := buildTestTree(t, map[string]string{
+		"example.md": agentContent,
+	})
+
+	// Head (committed): same file, only example.md was committed
+	// .claude/settings.json is NOT in the head tree (not committed)
+	headTree := buildTestTree(t, map[string]string{
+		"example.md": agentContent,
+	})
+
+	filesTouched := []string{"example.md"}
+
+	// PromptAttribution captured .claude/settings.json (84 lines) as user change
+	// at prompt start, because it was in the worktree but not in the base tree.
+	// This is the root cause of the bug: these 84 lines are never committed.
+	promptAttributions := []PromptAttribution{
+		{
+			CheckpointNumber: 1,
+			UserLinesAdded:   84,
+			UserLinesRemoved: 0,
+			UserAddedPerFile: map[string]int{".claude/settings.json": 84},
+		},
+	}
+
+	result := CalculateAttributionWithAccumulated(
+		context.Background(),
+		baseTree, shadowTree, headTree, filesTouched, promptAttributions, "", "", "",
+	)
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	agentLines := countLinesStr(agentContent)
+	t.Logf("Agent content has %d lines", agentLines)
+	t.Logf("Attribution: agent=%d, human_added=%d, total=%d, percentage=%.1f%%",
+		result.AgentLines, result.HumanAdded, result.TotalCommitted, result.AgentPercentage)
+
+	// Expected: agent created 100% of committed content
+	// .claude/settings.json should NOT affect attribution since it was never committed
+	if result.AgentLines != agentLines {
+		t.Errorf("AgentLines = %d, want %d", result.AgentLines, agentLines)
+	}
+	if result.HumanAdded != 0 {
+		t.Errorf("HumanAdded = %d, want 0 (.claude/settings.json was never committed)", result.HumanAdded)
+	}
+	if result.TotalCommitted != agentLines {
+		t.Errorf("TotalCommitted = %d, want %d (only agent-created file was committed)", result.TotalCommitted, agentLines)
+	}
+	if result.AgentPercentage != 100.0 {
+		t.Errorf("AgentPercentage = %.1f%%, want 100.0%% (agent created all committed content)", result.AgentPercentage)
 	}
 }
 

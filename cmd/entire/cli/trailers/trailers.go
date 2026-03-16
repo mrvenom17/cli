@@ -138,6 +138,32 @@ func ParseCheckpoint(commitMessage string) (checkpointID.CheckpointID, bool) {
 	return checkpointID.EmptyCheckpointID, false
 }
 
+// ParseAllCheckpoints extracts all checkpoint IDs from a commit message.
+// Returns a slice of CheckpointIDs (may be empty if none found).
+// Duplicate IDs are deduplicated while preserving order.
+// This is useful for squash merge commits that contain multiple Entire-Checkpoint trailers.
+func ParseAllCheckpoints(commitMessage string) []checkpointID.CheckpointID {
+	matches := checkpointTrailerRegex.FindAllStringSubmatch(commitMessage, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	ids := make([]checkpointID.CheckpointID, 0, len(matches))
+	for _, match := range matches {
+		if len(match) > 1 {
+			idStr := strings.TrimSpace(match[1])
+			if !seen[idStr] {
+				if cpID, err := checkpointID.NewCheckpointID(idStr); err == nil {
+					seen[idStr] = true
+					ids = append(ids, cpID)
+				}
+			}
+		}
+	}
+	return ids
+}
+
 // ParseAllSessions extracts all session IDs from a commit message.
 // Returns a slice of session IDs (may be empty if none found).
 // Duplicate session IDs are deduplicated while preserving order.
@@ -178,11 +204,11 @@ func FormatTaskMetadataWithStrategy(message, taskMetadataDir, strategy string) s
 }
 
 // FormatSourceRef creates a formatted source ref string for the trailer.
-// Format: "<branch>@<commit-hash-prefix>" (hash truncated to 12 chars)
+// Format: "<branch>@<commit-hash-prefix>" (hash truncated to ShortIDLength chars)
 func FormatSourceRef(branch, commitHash string) string {
 	shortHash := commitHash
-	if len(shortHash) > 12 {
-		shortHash = shortHash[:12]
+	if len(shortHash) > checkpointID.ShortIDLength {
+		shortHash = shortHash[:checkpointID.ShortIDLength]
 	}
 	return fmt.Sprintf("%s@%s", branch, shortHash)
 }
@@ -203,9 +229,9 @@ func FormatShadowCommit(message, metadataDir, sessionID string) string {
 	var sb strings.Builder
 	sb.WriteString(message)
 	sb.WriteString("\n\n")
-	sb.WriteString(fmt.Sprintf("%s: %s\n", MetadataTrailerKey, metadataDir))
-	sb.WriteString(fmt.Sprintf("%s: %s\n", SessionTrailerKey, sessionID))
-	sb.WriteString(fmt.Sprintf("%s: %s\n", StrategyTrailerKey, "manual-commit"))
+	fmt.Fprintf(&sb, "%s: %s\n", MetadataTrailerKey, metadataDir)
+	fmt.Fprintf(&sb, "%s: %s\n", SessionTrailerKey, sessionID)
+	fmt.Fprintf(&sb, "%s: %s\n", StrategyTrailerKey, "manual-commit")
 	return sb.String()
 }
 
@@ -215,9 +241,9 @@ func FormatShadowTaskCommit(message, taskMetadataDir, sessionID string) string {
 	var sb strings.Builder
 	sb.WriteString(message)
 	sb.WriteString("\n\n")
-	sb.WriteString(fmt.Sprintf("%s: %s\n", MetadataTaskTrailerKey, taskMetadataDir))
-	sb.WriteString(fmt.Sprintf("%s: %s\n", SessionTrailerKey, sessionID))
-	sb.WriteString(fmt.Sprintf("%s: %s\n", StrategyTrailerKey, "manual-commit"))
+	fmt.Fprintf(&sb, "%s: %s\n", MetadataTaskTrailerKey, taskMetadataDir)
+	fmt.Fprintf(&sb, "%s: %s\n", SessionTrailerKey, sessionID)
+	fmt.Fprintf(&sb, "%s: %s\n", StrategyTrailerKey, "manual-commit")
 	return sb.String()
 }
 

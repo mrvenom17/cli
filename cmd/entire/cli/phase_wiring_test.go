@@ -1,13 +1,14 @@
 package cli
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 
-	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v6"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,15 +26,15 @@ func TestMarkSessionEnded_SetsPhaseEnded(t *testing.T) {
 		StartedAt:  time.Now(),
 		Phase:      session.PhaseActive,
 	}
-	err := strategy.SaveSessionState(state)
+	err := strategy.SaveSessionState(context.Background(), state)
 	require.NoError(t, err)
 
 	// Call markSessionEnded
-	err = markSessionEnded("test-session-end-1")
+	err = markSessionEnded(context.Background(), nil, "test-session-end-1")
 	require.NoError(t, err)
 
 	// Verify phase is ENDED
-	loaded, err := strategy.LoadSessionState("test-session-end-1")
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-1")
 	require.NoError(t, err)
 	require.NotNil(t, loaded)
 
@@ -56,38 +57,16 @@ func TestMarkSessionEnded_IdleToEnded(t *testing.T) {
 		StartedAt:  time.Now(),
 		Phase:      session.PhaseIdle,
 	}
-	err := strategy.SaveSessionState(state)
+	err := strategy.SaveSessionState(context.Background(), state)
 	require.NoError(t, err)
 
-	err = markSessionEnded("test-session-end-idle")
+	err = markSessionEnded(context.Background(), nil, "test-session-end-idle")
 	require.NoError(t, err)
 
-	loaded, err := strategy.LoadSessionState("test-session-end-idle")
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-idle")
 	require.NoError(t, err)
 	assert.Equal(t, session.PhaseEnded, loaded.Phase)
 	require.NotNil(t, loaded.EndedAt)
-}
-
-// TestMarkSessionEnded_ActiveCommittedToEnded verifies ACTIVE_COMMITTED → ENDED.
-func TestMarkSessionEnded_ActiveCommittedToEnded(t *testing.T) {
-	dir := setupGitRepoForPhaseTest(t)
-	t.Chdir(dir)
-
-	state := &strategy.SessionState{
-		SessionID:  "test-session-end-ac",
-		BaseCommit: "abc123",
-		StartedAt:  time.Now(),
-		Phase:      session.PhaseActiveCommitted,
-	}
-	err := strategy.SaveSessionState(state)
-	require.NoError(t, err)
-
-	err = markSessionEnded("test-session-end-ac")
-	require.NoError(t, err)
-
-	loaded, err := strategy.LoadSessionState("test-session-end-ac")
-	require.NoError(t, err)
-	assert.Equal(t, session.PhaseEnded, loaded.Phase)
 }
 
 // TestMarkSessionEnded_AlreadyEndedIsNoop verifies ENDED → ENDED (no-op).
@@ -103,13 +82,13 @@ func TestMarkSessionEnded_AlreadyEndedIsNoop(t *testing.T) {
 		Phase:      session.PhaseEnded,
 		EndedAt:    &originalEndedAt,
 	}
-	err := strategy.SaveSessionState(state)
+	err := strategy.SaveSessionState(context.Background(), state)
 	require.NoError(t, err)
 
-	err = markSessionEnded("test-session-end-noop")
+	err = markSessionEnded(context.Background(), nil, "test-session-end-noop")
 	require.NoError(t, err)
 
-	loaded, err := strategy.LoadSessionState("test-session-end-noop")
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-noop")
 	require.NoError(t, err)
 	assert.Equal(t, session.PhaseEnded, loaded.Phase)
 	// EndedAt should still be set (updated, not cleared)
@@ -128,13 +107,13 @@ func TestMarkSessionEnded_EmptyPhaseBackwardCompat(t *testing.T) {
 		StartedAt:  time.Now(),
 		Phase:      "", // pre-state-machine
 	}
-	err := strategy.SaveSessionState(state)
+	err := strategy.SaveSessionState(context.Background(), state)
 	require.NoError(t, err)
 
-	err = markSessionEnded("test-session-end-compat")
+	err = markSessionEnded(context.Background(), nil, "test-session-end-compat")
 	require.NoError(t, err)
 
-	loaded, err := strategy.LoadSessionState("test-session-end-compat")
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-compat")
 	require.NoError(t, err)
 	assert.Equal(t, session.PhaseEnded, loaded.Phase,
 		"empty phase → IDLE → ENDED")
@@ -146,7 +125,7 @@ func TestMarkSessionEnded_NoState(t *testing.T) {
 	dir := setupGitRepoForPhaseTest(t)
 	t.Chdir(dir)
 
-	err := markSessionEnded("nonexistent-session")
+	err := markSessionEnded(context.Background(), nil, "nonexistent-session")
 	assert.NoError(t, err, "should be a no-op when no state exists")
 }
 

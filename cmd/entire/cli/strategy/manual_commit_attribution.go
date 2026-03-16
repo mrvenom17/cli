@@ -1,61 +1,82 @@
 package strategy
 
 import (
+	"context"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/entireio/cli/cmd/entire/cli/gitops"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
+	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// getAllChangedFilesBetweenTrees returns a list of all files that differ between two trees.
-// This includes files that were added, modified, or deleted in either tree.
-// Uses git blob hashes for efficient comparison without reading file contents.
-func getAllChangedFilesBetweenTrees(tree1, tree2 *object.Tree) []string {
-	if tree1 == nil && tree2 == nil {
-		return nil
+// getAllChangedFiles returns all files that changed between the attribution base
+// and HEAD. When commit hashes and repoDir are provided, uses fast git diff-tree CLI;
+// otherwise falls back to go-git tree walk (used by CondenseSessionByID / doctor command).
+func getAllChangedFiles(ctx context.Context, baseTree, headTree *object.Tree, repoDir, baseCommitHash, headCommitHash string) ([]string, error) {
+	// Fast path: use git diff-tree when commit hashes are available
+	if baseCommitHash != "" && headCommitHash != "" {
+		return gitops.DiffTreeFileList(ctx, repoDir, baseCommitHash, headCommitHash) //nolint:wrapcheck // Propagating gitops error
 	}
 
-	// Build hash maps for each tree - O(n) iteration, no content reading
+	// Slow path: go-git tree walk (CondenseSessionByID fallback)
+	return getAllChangedFilesBetweenTreesSlow(ctx, baseTree, headTree)
+}
+
+// getAllChangedFilesBetweenTreesSlow returns a list of all files that differ between two trees.
+// This is the slow fallback path using go-git tree walks, used only when commit hashes
+// are not available (e.g., CondenseSessionByID / doctor command).
+func getAllChangedFilesBetweenTreesSlow(ctx context.Context, tree1, tree2 *object.Tree) ([]string, error) {
+	if tree1 == nil && tree2 == nil {
+		return nil, nil
+	}
+
 	tree1Hashes := make(map[string]string)
 	tree2Hashes := make(map[string]string)
 
 	if tree1 != nil {
-		//nolint:errcheck // Errors ignored - just collecting file hashes for diff comparison
-		_ = tree1.Files().ForEach(func(f *object.File) error {
+		if err := tree1.Files().ForEach(func(f *object.File) error {
+			if err := ctx.Err(); err != nil {
+				return err //nolint:wrapcheck // Propagating context cancellation
+			}
 			tree1Hashes[f.Name] = f.Hash.String()
 			return nil
-		})
+		}); err != nil {
+			return nil, err //nolint:wrapcheck // Propagating context/iteration error
+		}
 	}
 
 	if tree2 != nil {
-		//nolint:errcheck // Errors ignored - just collecting file hashes for diff comparison
-		_ = tree2.Files().ForEach(func(f *object.File) error {
+		if err := tree2.Files().ForEach(func(f *object.File) error {
+			if err := ctx.Err(); err != nil {
+				return err //nolint:wrapcheck // Propagating context cancellation
+			}
 			tree2Hashes[f.Name] = f.Hash.String()
 			return nil
-		})
+		}); err != nil {
+			return nil, err //nolint:wrapcheck // Propagating context/iteration error
+		}
 	}
 
-	// Find changed files by comparing hashes (much faster than content comparison)
 	var changed []string
 
-	// Check files in tree1 - either modified or deleted in tree2
 	for path, hash1 := range tree1Hashes {
 		if hash2, exists := tree2Hashes[path]; !exists || hash1 != hash2 {
 			changed = append(changed, path)
 		}
 	}
 
-	// Check files only in tree2 (added files)
 	for path := range tree2Hashes {
 		if _, exists := tree1Hashes[path]; !exists {
 			changed = append(changed, path)
 		}
 	}
 
-	return changed
+	return changed, nil
 }
 
 // getFileContent retrieves the content of a file from a tree.
@@ -158,16 +179,23 @@ func countLinesStr(content string) int {
 // 4. Estimate user self-modifications vs agent modifications using per-file tracking
 // 5. Compute percentages
 //
+// attributionBaseCommit and headCommitHash are optional commit hashes for fast non-agent
+// file detection via git diff-tree. When empty, falls back to go-git tree walk.
+//
 // Note: Binary files (detected by null bytes) are silently excluded from attribution
 // calculations since line-based diffing only applies to text files.
 //
 // See docs/architecture/attribution.md for details on the per-file tracking approach.
 func CalculateAttributionWithAccumulated(
+	ctx context.Context,
 	baseTree *object.Tree,
 	shadowTree *object.Tree,
 	headTree *object.Tree,
 	filesTouched []string,
 	promptAttributions []PromptAttribution,
+	repoDir string,
+	attributionBaseCommit string,
+	headCommitHash string,
 ) *checkpoint.InitialAttribution {
 	if len(filesTouched) == 0 {
 		return nil
@@ -216,9 +244,16 @@ func CalculateAttributionWithAccumulated(
 
 	// Calculate total user edits to non-agent files (files not in filesTouched)
 	// These files are not in the shadow tree, so base→head captures ALL their user edits
-	nonAgentFiles := getAllChangedFilesBetweenTrees(baseTree, headTree)
+	allChangedFiles, err := getAllChangedFiles(ctx, baseTree, headTree, repoDir, attributionBaseCommit, headCommitHash)
+	if err != nil {
+		logging.Warn(logging.WithComponent(ctx, "attribution"),
+			"attribution: failed to enumerate changed files",
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
 	var allUserEditsToNonAgentFiles int
-	for _, filePath := range nonAgentFiles {
+	for _, filePath := range allChangedFiles {
 		if slices.Contains(filesTouched, filePath) {
 			continue // Skip agent-touched files
 		}
@@ -230,25 +265,41 @@ func CalculateAttributionWithAccumulated(
 	}
 
 	// Separate accumulated edits by file type using per-file tracking data.
-	// This is precise because accumulatedUserAddedPerFile tells us exactly which files
-	// the user edited between checkpoints.
-	var accumulatedToAgentFiles, accumulatedToNonAgentFiles int
+	// Only count changes to files that are actually committed:
+	// - Agent-touched files (filesTouched)
+	// - Non-agent files that appear in the commit (base→head diff)
+	// Files not in either set are worktree-only changes (e.g., .claude/settings.json)
+	// that should not affect attribution.
+	committedNonAgentSet := make(map[string]struct{}, len(allChangedFiles))
+	for _, f := range allChangedFiles {
+		if !slices.Contains(filesTouched, f) {
+			committedNonAgentSet[f] = struct{}{}
+		}
+	}
+
+	var accumulatedToAgentFiles, accumulatedToCommittedNonAgentFiles int
 	for filePath, added := range accumulatedUserAddedPerFile {
 		if slices.Contains(filesTouched, filePath) {
 			accumulatedToAgentFiles += added
-		} else {
-			accumulatedToNonAgentFiles += added
+		} else if _, ok := committedNonAgentSet[filePath]; ok {
+			accumulatedToCommittedNonAgentFiles += added
 		}
+		// else: file not committed (worktree-only), excluded from attribution
 	}
 
 	// Agent work = (base→shadow for agent files) - (accumulated user edits to agent files only)
 	totalAgentAdded := max(0, totalAgentAndUserWork-accumulatedToAgentFiles)
 
 	// Post-checkpoint edits to non-agent files = total edits - accumulated portion (never negative)
-	postToNonAgentFiles := max(0, allUserEditsToNonAgentFiles-accumulatedToNonAgentFiles)
+	postToNonAgentFiles := max(0, allUserEditsToNonAgentFiles-accumulatedToCommittedNonAgentFiles)
 
-	// Total user contribution = accumulated (all files) + post-checkpoint (agent files) + post-checkpoint (non-agent files)
-	totalUserAdded := accumulatedUserAdded + postCheckpointUserAdded + postToNonAgentFiles
+	// Total user contribution = accumulated (committed files only) + post-checkpoint edits
+	relevantAccumulatedUser := accumulatedToAgentFiles + accumulatedToCommittedNonAgentFiles
+	totalUserAdded := relevantAccumulatedUser + postCheckpointUserAdded + postToNonAgentFiles
+	// TODO: accumulatedUserRemoved also includes removals from uncommitted files,
+	// but we don't have per-file tracking for removals yet. In practice, removals
+	// from uncommitted files are rare and the impact is minor (could slightly reduce
+	// totalCommitted via pureUserRemoved). Add UserRemovedPerFile if this becomes an issue.
 	totalUserRemoved := accumulatedUserRemoved + postCheckpointUserRemoved
 
 	// Estimate modified lines (user changed existing lines)

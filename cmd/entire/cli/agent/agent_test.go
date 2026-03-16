@@ -1,43 +1,50 @@
 package agent
 
 import (
+	"context"
 	"io"
 	"testing"
-	"time"
+
+	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 )
 
-const mockAgentName AgentName = "mock" // Used by mock implementations
-const mockAgentType AgentType = "Mock Agent"
+const mockAgentName types.AgentName = "mock" // Used by mock implementations
+const mockAgentType types.AgentType = "Mock Agent"
 
 // mockAgent is a minimal implementation of Agent for testing interface compliance.
 type mockAgent struct{}
 
 var _ Agent = (*mockAgent)(nil) // Compile-time interface check
 
-func (m *mockAgent) Name() AgentName               { return mockAgentName }
-func (m *mockAgent) Type() AgentType               { return mockAgentType }
-func (m *mockAgent) Description() string           { return "Mock agent for testing" }
-func (m *mockAgent) DetectPresence() (bool, error) { return false, nil }
-func (m *mockAgent) GetHookConfigPath() string     { return "" }
-func (m *mockAgent) SupportsHooks() bool           { return false }
+func (m *mockAgent) Name() types.AgentName                          { return mockAgentName }
+func (m *mockAgent) Type() types.AgentType                          { return mockAgentType }
+func (m *mockAgent) Description() string                            { return "Mock agent for testing" }
+func (m *mockAgent) IsPreview() bool                                { return false }
+func (m *mockAgent) DetectPresence(_ context.Context) (bool, error) { return false, nil }
 
-//nolint:nilnil // Mock implementation
-func (m *mockAgent) ParseHookInput(_ HookType, _ io.Reader) (*HookInput, error) {
-	return nil, nil
+func (m *mockAgent) GetSessionID(_ *HookInput) string { return "" }
+func (m *mockAgent) ProtectedDirs() []string          { return nil }
+
+func (m *mockAgent) ReadTranscript(_ string) ([]byte, error) { return nil, nil }
+func (m *mockAgent) ChunkTranscript(_ context.Context, content []byte, _ int) ([][]byte, error) {
+	return [][]byte{content}, nil
 }
-func (m *mockAgent) GetSessionID(_ *HookInput) string             { return "" }
-func (m *mockAgent) TransformSessionID(agentID string) string     { return agentID }
-func (m *mockAgent) ExtractAgentSessionID(entireID string) string { return entireID }
-func (m *mockAgent) ProtectedDirs() []string                      { return nil }
-func (m *mockAgent) GetSessionDir(_ string) (string, error)       { return "", nil }
+func (m *mockAgent) ReassembleTranscript(chunks [][]byte) ([]byte, error) {
+	var result []byte
+	for _, c := range chunks {
+		result = append(result, c...)
+	}
+	return result, nil
+}
+func (m *mockAgent) GetSessionDir(_ string) (string, error) { return "", nil }
 func (m *mockAgent) ResolveSessionFile(sessionDir, agentSessionID string) string {
 	return sessionDir + "/" + agentSessionID + ".jsonl"
 }
 
 //nolint:nilnil // Mock implementation
-func (m *mockAgent) ReadSession(_ *HookInput) (*AgentSession, error) { return nil, nil }
-func (m *mockAgent) WriteSession(_ *AgentSession) error              { return nil }
-func (m *mockAgent) FormatResumeCommand(_ string) string             { return "" }
+func (m *mockAgent) ReadSession(_ *HookInput) (*AgentSession, error)       { return nil, nil }
+func (m *mockAgent) WriteSession(_ context.Context, _ *AgentSession) error { return nil }
+func (m *mockAgent) FormatResumeCommand(_ string) string                   { return "" }
 
 // mockHookSupport implements both Agent and HookSupport interfaces.
 type mockHookSupport struct {
@@ -46,10 +53,15 @@ type mockHookSupport struct {
 
 var _ HookSupport = (*mockHookSupport)(nil) // Compile-time interface check
 
-func (m *mockHookSupport) InstallHooks(_, _ bool) (int, error) { return 0, nil }
-func (m *mockHookSupport) UninstallHooks() error               { return nil }
-func (m *mockHookSupport) AreHooksInstalled() bool             { return false }
-func (m *mockHookSupport) GetSupportedHooks() []HookType       { return nil }
+func (m *mockHookSupport) HookNames() []string { return nil }
+
+//nolint:nilnil // Mock implementation
+func (m *mockHookSupport) ParseHookEvent(_ context.Context, _ string, _ io.Reader) (*Event, error) {
+	return nil, nil
+}
+func (m *mockHookSupport) InstallHooks(_ context.Context, _, _ bool) (int, error) { return 0, nil }
+func (m *mockHookSupport) UninstallHooks(_ context.Context) error                 { return nil }
+func (m *mockHookSupport) AreHooksInstalled(_ context.Context) bool               { return false }
 
 // mockFileWatcher implements both Agent and FileWatcher interfaces.
 type mockFileWatcher struct {
@@ -134,15 +146,9 @@ func TestEntryTypeConstants(t *testing.T) {
 //nolint:govet // testing struct field assignment
 func TestHookInputStructure(t *testing.T) {
 	input := HookInput{
-		HookType:     HookPreToolUse,
-		SessionID:    "test-session",
-		SessionRef:   "/path/to/session",
-		Timestamp:    time.Now(),
-		ToolName:     "Write",
-		ToolUseID:    "tool-123",
-		ToolInput:    []byte(`{"file_path": "test.go"}`),
-		ToolResponse: nil,
-		RawData:      map[string]interface{}{"extra": "data"},
+		HookType:  HookPreToolUse,
+		SessionID: "test-session",
+		RawData:   map[string]interface{}{"extra": "data"},
 	}
 
 	if input.HookType != HookPreToolUse {
@@ -153,13 +159,10 @@ func TestHookInputStructure(t *testing.T) {
 	}
 }
 
-//nolint:govet // testing struct field assignment
 func TestSessionChangeStructure(t *testing.T) {
 	change := SessionChange{
-		SessionID:  "test-session",
-		SessionRef: "/path/to/session",
-		EventType:  HookSessionStart,
-		Timestamp:  time.Now(),
+		SessionID: "test-session",
+		EventType: HookSessionStart,
 	}
 
 	if change.SessionID != "test-session" {

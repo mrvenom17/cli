@@ -5,18 +5,16 @@ package settings
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 )
-
-// DefaultStrategyName is the default strategy when none is configured.
-// This is duplicated here to avoid importing the strategy package (which would create a cycle).
-const DefaultStrategyName = "manual-commit"
 
 const (
 	// EntireSettingsFile is the path to the Entire settings file
@@ -25,10 +23,16 @@ const (
 	EntireSettingsLocalFile = ".entire/settings.local.json"
 )
 
+// Commit linking mode constants.
+const (
+	// CommitLinkingAlways auto-links commits to sessions without prompting.
+	CommitLinkingAlways = "always"
+	// CommitLinkingPrompt prompts the user on each commit (default for existing users).
+	CommitLinkingPrompt = "prompt"
+)
+
 // EntireSettings represents the .entire/settings.json configuration
 type EntireSettings struct {
-	// Strategy is the name of the git strategy to use
-	Strategy string `json:"strategy"`
 
 	// Enabled indicates whether Entire is active. When false, CLI commands
 	// show a disabled message and hooks exit silently. Defaults to true.
@@ -46,22 +50,50 @@ type EntireSettings struct {
 	// StrategyOptions contains strategy-specific configuration
 	StrategyOptions map[string]any `json:"strategy_options,omitempty"`
 
+	// AbsoluteGitHookPath embeds the full binary path in git hooks instead of
+	// bare "entire". This is needed for GUI git clients (Xcode, Tower, etc.)
+	// that don't source shell profiles and can't find "entire" on PATH.
+	AbsoluteGitHookPath bool `json:"absolute_git_hook_path,omitempty"`
+
 	// Telemetry controls anonymous usage analytics.
 	// nil = not asked yet (show prompt), true = opted in, false = opted out
 	Telemetry *bool `json:"telemetry,omitempty"`
+
+	// CommitLinking controls how commits are linked to agent sessions.
+	// "always" = auto-link without prompting, "prompt" = ask on each commit.
+	// Defaults to "prompt" (preserves existing user behavior).
+	CommitLinking string `json:"commit_linking,omitempty"`
+
+	// ExternalAgents enables discovery and registration of external agent
+	// plugins (entire-agent-* binaries on $PATH). Defaults to false.
+	ExternalAgents bool `json:"external_agents,omitempty"`
+
+	// Deprecated: no longer used. Exists to tolerate old settings files
+	// that still contain "strategy": "auto-commit" or similar.
+	Strategy string `json:"strategy,omitempty"`
+}
+
+// GetCommitLinking returns the effective commit linking mode.
+// Returns the explicit value if set, otherwise defaults to "prompt"
+// to preserve existing user behavior.
+func (s *EntireSettings) GetCommitLinking() string {
+	if s.CommitLinking != "" {
+		return s.CommitLinking
+	}
+	return CommitLinkingPrompt
 }
 
 // Load loads the Entire settings from .entire/settings.json,
 // then applies any overrides from .entire/settings.local.json if it exists.
 // Returns default settings if neither file exists.
 // Works correctly from any subdirectory within the repository.
-func Load() (*EntireSettings, error) {
+func Load(ctx context.Context) (*EntireSettings, error) {
 	// Get absolute paths for settings files
-	settingsFileAbs, err := paths.AbsPath(EntireSettingsFile)
+	settingsFileAbs, err := paths.AbsPath(ctx, EntireSettingsFile)
 	if err != nil {
 		settingsFileAbs = EntireSettingsFile // Fallback to relative
 	}
-	localSettingsFileAbs, err := paths.AbsPath(EntireSettingsLocalFile)
+	localSettingsFileAbs, err := paths.AbsPath(ctx, EntireSettingsLocalFile)
 	if err != nil {
 		localSettingsFileAbs = EntireSettingsLocalFile // Fallback to relative
 	}
@@ -85,8 +117,6 @@ func Load() (*EntireSettings, error) {
 		}
 	}
 
-	applyDefaults(settings)
-
 	return settings, nil
 }
 
@@ -101,8 +131,7 @@ func LoadFromFile(filePath string) (*EntireSettings, error) {
 // Returns default settings if the file doesn't exist.
 func loadFromFile(filePath string) (*EntireSettings, error) {
 	settings := &EntireSettings{
-		Strategy: DefaultStrategyName,
-		Enabled:  true, // Default to enabled
+		Enabled: true, // Default to enabled
 	}
 
 	data, err := os.ReadFile(filePath) //nolint:gosec // path is from caller
@@ -118,7 +147,11 @@ func loadFromFile(filePath string) (*EntireSettings, error) {
 	if err := dec.Decode(settings); err != nil {
 		return nil, fmt.Errorf("parsing settings file: %w", err)
 	}
-	applyDefaults(settings)
+
+	// Validate commit_linking if set
+	if settings.CommitLinking != "" && settings.CommitLinking != CommitLinkingAlways && settings.CommitLinking != CommitLinkingPrompt {
+		return nil, fmt.Errorf("invalid commit_linking value %q: must be %q or %q", settings.CommitLinking, CommitLinkingAlways, CommitLinkingPrompt)
+	}
 
 	return settings, nil
 }
@@ -140,17 +173,6 @@ func mergeJSON(settings *EntireSettings, data []byte) error {
 		return fmt.Errorf("parsing JSON: %w", err)
 	}
 
-	// Override strategy if present and non-empty
-	if strategyRaw, ok := raw["strategy"]; ok {
-		var s string
-		if err := json.Unmarshal(strategyRaw, &s); err != nil {
-			return fmt.Errorf("parsing strategy field: %w", err)
-		}
-		if s != "" {
-			settings.Strategy = s
-		}
-	}
-
 	// Override enabled if present
 	if enabledRaw, ok := raw["enabled"]; ok {
 		var e bool
@@ -167,6 +189,15 @@ func mergeJSON(settings *EntireSettings, data []byte) error {
 			return fmt.Errorf("parsing local_dev field: %w", err)
 		}
 		settings.LocalDev = ld
+	}
+
+	// Override absolute_git_hook_path if present
+	if ahpRaw, ok := raw["absolute_git_hook_path"]; ok {
+		var ahp bool
+		if err := json.Unmarshal(ahpRaw, &ahp); err != nil {
+			return fmt.Errorf("parsing absolute_git_hook_path field: %w", err)
+		}
+		settings.AbsoluteGitHookPath = ahp
 	}
 
 	// Override log_level if present and non-empty
@@ -204,19 +235,64 @@ func mergeJSON(settings *EntireSettings, data []byte) error {
 		settings.Telemetry = &t
 	}
 
+	// Override commit_linking if present and non-empty
+	if commitLinkingRaw, ok := raw["commit_linking"]; ok {
+		var cl string
+		if err := json.Unmarshal(commitLinkingRaw, &cl); err != nil {
+			return fmt.Errorf("parsing commit_linking field: %w", err)
+		}
+		if cl != "" {
+			switch cl {
+			case CommitLinkingAlways, CommitLinkingPrompt:
+				settings.CommitLinking = cl
+			default:
+				return fmt.Errorf("invalid commit_linking value %q: must be %q or %q", cl, CommitLinkingAlways, CommitLinkingPrompt)
+			}
+		}
+	}
+
+	// Override external_agents if present
+	if externalAgentsRaw, ok := raw["external_agents"]; ok {
+		var ea bool
+		if err := json.Unmarshal(externalAgentsRaw, &ea); err != nil {
+			return fmt.Errorf("parsing external_agents field: %w", err)
+		}
+		settings.ExternalAgents = ea
+	}
+
 	return nil
 }
 
-func applyDefaults(settings *EntireSettings) {
-	if settings.Strategy == "" {
-		settings.Strategy = DefaultStrategyName
+// IsSetUp returns true if Entire has been set up in the current repository.
+// This checks if .entire/settings.json exists.
+// Use this to avoid creating files/directories in repos where Entire was never enabled.
+func IsSetUp(ctx context.Context) bool {
+	settingsFileAbs, err := paths.AbsPath(ctx, EntireSettingsFile)
+	if err != nil {
+		return false
 	}
+	_, err = os.Stat(settingsFileAbs)
+	return err == nil
+}
+
+// IsSetUpAndEnabled returns true if Entire is both set up and enabled.
+// This checks if .entire/settings.json exists AND has enabled: true.
+// Use this for hooks that should be no-ops when Entire is not active.
+func IsSetUpAndEnabled(ctx context.Context) bool {
+	if !IsSetUp(ctx) {
+		return false
+	}
+	s, err := Load(ctx)
+	if err != nil {
+		return false
+	}
+	return s.Enabled
 }
 
 // IsSummarizeEnabled checks if auto-summarize is enabled in settings.
 // Returns false by default if settings cannot be loaded or the key is missing.
-func IsSummarizeEnabled() bool {
-	settings, err := Load()
+func IsSummarizeEnabled(ctx context.Context) bool {
+	settings, err := Load(ctx)
 	if err != nil {
 		return false
 	}
@@ -239,6 +315,49 @@ func (s *EntireSettings) IsSummarizeEnabled() bool {
 	return enabled
 }
 
+// CheckpointRemoteConfig holds the structured checkpoint remote configuration.
+// Stored in strategy_options.checkpoint_remote as {"provider": "github", "repo": "org/repo"}.
+type CheckpointRemoteConfig struct {
+	Provider string // e.g., "github"
+	Repo     string // e.g., "org/checkpoints-repo"
+}
+
+// Owner returns the owner portion of the repo field (before the slash).
+// Returns empty string if the repo field doesn't contain a slash.
+func (c *CheckpointRemoteConfig) Owner() string {
+	parts := strings.SplitN(c.Repo, "/", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0]
+}
+
+// GetCheckpointRemote returns the configured checkpoint remote.
+// Expects a structured object: {"provider": "github", "repo": "org/repo"}.
+// Returns nil if not configured, wrong type, or missing required fields.
+func (s *EntireSettings) GetCheckpointRemote() *CheckpointRemoteConfig {
+	if s.StrategyOptions == nil {
+		return nil
+	}
+	val, ok := s.StrategyOptions["checkpoint_remote"]
+	if !ok {
+		return nil
+	}
+	m, ok := val.(map[string]any)
+	if !ok {
+		return nil
+	}
+	provider, providerOK := m["provider"].(string)
+	repo, repoOK := m["repo"].(string)
+	if !providerOK || !repoOK || provider == "" || repo == "" {
+		return nil
+	}
+	if !strings.Contains(repo, "/") {
+		return nil
+	}
+	return &CheckpointRemoteConfig{Provider: provider, Repo: repo}
+}
+
 // IsPushSessionsDisabled checks if push_sessions is disabled in settings.
 // Returns true if push_sessions is explicitly set to false.
 func (s *EntireSettings) IsPushSessionsDisabled() bool {
@@ -255,20 +374,30 @@ func (s *EntireSettings) IsPushSessionsDisabled() bool {
 	return false
 }
 
+// IsExternalAgentsEnabled checks if external agent discovery is enabled in settings.
+// Returns false by default if settings cannot be loaded or the key is missing.
+func IsExternalAgentsEnabled(ctx context.Context) bool {
+	s, err := Load(ctx)
+	if err != nil {
+		return false
+	}
+	return s.ExternalAgents
+}
+
 // Save saves the settings to .entire/settings.json.
-func Save(settings *EntireSettings) error {
-	return saveToFile(settings, EntireSettingsFile)
+func Save(ctx context.Context, settings *EntireSettings) error {
+	return saveToFile(ctx, settings, EntireSettingsFile)
 }
 
 // SaveLocal saves the settings to .entire/settings.local.json.
-func SaveLocal(settings *EntireSettings) error {
-	return saveToFile(settings, EntireSettingsLocalFile)
+func SaveLocal(ctx context.Context, settings *EntireSettings) error {
+	return saveToFile(ctx, settings, EntireSettingsLocalFile)
 }
 
 // saveToFile saves settings to the specified file path.
-func saveToFile(settings *EntireSettings, filePath string) error {
+func saveToFile(ctx context.Context, settings *EntireSettings, filePath string) error {
 	// Get absolute path for the file
-	filePathAbs, err := paths.AbsPath(filePath)
+	filePathAbs, err := paths.AbsPath(ctx, filePath)
 	if err != nil {
 		filePathAbs = filePath // Fallback to relative
 	}

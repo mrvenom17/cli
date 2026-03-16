@@ -90,9 +90,8 @@ Fires when Claude finishes responding. Does **not** fire on user interrupt (Ctrl
 2.  **Extract and Save Metadata** (to `.entire/metadata/<session-id>/`):
 
     - `full.jsonl` - Copy of the complete transcript.
-    - `prompt.txt` - All user prompts from this interaction, separated by `---`.
+    - `prompt.txt` - Checkpoint-scoped user prompts, separated by `---`.
     - `summary.txt` - The last assistant message (used as checkpoint summary).
-    - `context.md` - Generated context file with commit message, session info, and file lists.
 
 3.  **Compute File Changes**:
 
@@ -117,10 +116,9 @@ Fires when Claude finishes responding. Does **not** fire on user interrupt (Ctrl
     - Builds a `SaveContext` with session ID, file lists, metadata paths, git author info, and token usage.
     - Calls `strategy.SaveChanges(ctx)` to create the checkpoint.
     - **Manual-commit**: Builds a git tree in-memory and commits to the shadow branch.
-    - **Auto-commit**: Creates a commit on the active branch with the `Entire-Checkpoint` trailer.
     - Token usage is stored in `metadata.json` for later analysis and reporting.
 
-7.  **Update Session State**: Updates `CheckpointTranscriptStart` to track transcript position for detecting new content in future checkpoints (auto-commit strategy only).
+7.  **Update Session State**: Updates `CheckpointTranscriptStart` to track transcript position for detecting new content in future checkpoints.
 
 8.  **Cleanup**: Deletes the temporary `.entire/tmp/pre-prompt-<session-id>.json` file.
 

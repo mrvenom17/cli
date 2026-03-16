@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
-	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
+	"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"
 	"github.com/entireio/cli/cmd/entire/cli/agent/geminicli"
+	"github.com/entireio/cli/cmd/entire/cli/agent/opencode"
+	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	cpkg "github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
@@ -22,20 +25,20 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/textutil"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // listCheckpoints returns all checkpoints from the metadata branch.
 // Uses checkpoint.GitStore.ListCommitted() for reading from entire/checkpoints/v1.
-func (s *ManualCommitStrategy) listCheckpoints() ([]CheckpointInfo, error) {
+func (s *ManualCommitStrategy) listCheckpoints(ctx context.Context) ([]CheckpointInfo, error) {
 	store, err := s.getCheckpointStore()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get checkpoint store: %w", err)
 	}
 
-	committed, err := store.ListCommitted(context.Background())
+	committed, err := store.ListCommitted(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list committed checkpoints: %w", err)
 	}
@@ -60,36 +63,15 @@ func (s *ManualCommitStrategy) listCheckpoints() ([]CheckpointInfo, error) {
 	return result, nil
 }
 
-// getCheckpointsForSession returns all checkpoints for a session ID.
-func (s *ManualCommitStrategy) getCheckpointsForSession(sessionID string) ([]CheckpointInfo, error) {
-	all, err := s.listCheckpoints()
-	if err != nil {
-		return nil, err
-	}
-
-	var result []CheckpointInfo
-	for _, cp := range all {
-		if cp.SessionID == sessionID || strings.HasPrefix(cp.SessionID, sessionID) {
-			result = append(result, cp)
-		}
-	}
-
-	if len(result) == 0 {
-		return nil, fmt.Errorf("no checkpoints for session: %s", sessionID)
-	}
-
-	return result, nil
-}
-
 // getCheckpointLog returns the transcript for a specific checkpoint ID.
 // Uses checkpoint.GitStore.ReadCommitted() for reading from entire/checkpoints/v1.
-func (s *ManualCommitStrategy) getCheckpointLog(checkpointID id.CheckpointID) ([]byte, error) {
+func (s *ManualCommitStrategy) getCheckpointLog(ctx context.Context, checkpointID id.CheckpointID) ([]byte, error) {
 	store, err := s.getCheckpointStore()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get checkpoint store: %w", err)
 	}
 
-	content, err := store.ReadLatestSessionContent(context.Background(), checkpointID)
+	content, err := store.ReadLatestSessionContent(ctx, checkpointID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read checkpoint: %w", err)
 	}
@@ -103,29 +85,95 @@ func (s *ManualCommitStrategy) getCheckpointLog(checkpointID id.CheckpointID) ([
 	return content.Transcript, nil
 }
 
+// condenseOpts provides pre-resolved git objects to avoid redundant reads.
+type condenseOpts struct {
+	shadowRef      *plumbing.Reference // Pre-resolved shadow branch ref (nil = resolve from repo)
+	headTree       *object.Tree        // Pre-resolved HEAD tree (passed through to calculateSessionAttributions)
+	repoDir        string              // Repository worktree path for git CLI commands
+	headCommitHash string              // HEAD commit hash (passed through for attribution)
+}
+
 // CondenseSession condenses a session's shadow branch to permanent storage.
 // checkpointID is the 12-hex-char value from the Entire-Checkpoint trailer.
 // Metadata is stored at sharded path: <checkpoint_id[:2]>/<checkpoint_id[2:]>/
 // Uses checkpoint.GitStore.WriteCommitted for the git operations.
-func (s *ManualCommitStrategy) CondenseSession(repo *git.Repository, checkpointID id.CheckpointID, state *SessionState) (*CondenseResult, error) {
-	// Get shadow branch
-	shadowBranchName := getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)
-	refName := plumbing.NewBranchReferenceName(shadowBranchName)
-	ref, err := repo.Reference(refName, true)
-	if err != nil {
-		return nil, fmt.Errorf("shadow branch not found: %w", err)
+//
+// For mid-session commits (no Stop/SaveStep called yet), the shadow branch may not exist.
+// In this case, data is extracted from the live transcript instead.
+func (s *ManualCommitStrategy) CondenseSession(ctx context.Context, repo *git.Repository, checkpointID id.CheckpointID, state *SessionState, committedFiles map[string]struct{}, opts ...condenseOpts) (*CondenseResult, error) {
+	ag, _ := agent.GetByAgentType(state.AgentType) //nolint:errcheck // ag may be nil for unknown agent types; callers use type assertions so nil is safe
+	var o condenseOpts
+	if len(opts) > 0 {
+		o = opts[0]
 	}
 
-	// Extract session data from the shadow branch (with live transcript fallback).
-	// Use tracked files from session state instead of collecting all files from tree.
-	// Pass agent type to handle different transcript formats (JSONL for Claude, JSON for Gemini).
-	// Pass live transcript path so condensation reads the current file rather than a
-	// potentially stale shadow branch copy (SaveChanges may have been skipped if the
-	// last turn had no code changes).
-	// Pass CheckpointTranscriptStart for accurate token calculation (line offset for Claude, message index for Gemini).
-	sessionData, err := s.extractSessionData(repo, ref.Hash(), state.SessionID, state.FilesTouched, state.AgentType, state.TranscriptPath, state.CheckpointTranscriptStart)
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract session data: %w", err)
+	// Get shadow branch — use pre-resolved ref if available, otherwise resolve from repo.
+	shadowBranchName := getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)
+	ref := o.shadowRef
+	var hasShadowBranch bool
+	if ref != nil {
+		hasShadowBranch = true
+	} else {
+		refName := plumbing.NewBranchReferenceName(shadowBranchName)
+		var err error
+		ref, err = repo.Reference(refName, true)
+		hasShadowBranch = err == nil
+	}
+
+	var sessionData *ExtractedSessionData
+	if hasShadowBranch {
+		var extractErr error
+		sessionData, extractErr = s.extractSessionData(ctx, repo, ref.Hash(), state.SessionID, state.FilesTouched, state.AgentType, state.TranscriptPath, state.CheckpointTranscriptStart, state.Phase.IsActive())
+		if extractErr != nil {
+			return nil, fmt.Errorf("failed to extract session data: %w", extractErr)
+		}
+	} else {
+		if state.TranscriptPath == "" {
+			return nil, errors.New("shadow branch not found and no live transcript available")
+		}
+		if state.Phase.IsActive() {
+			prepareTranscriptIfNeeded(ctx, ag, state.TranscriptPath)
+		}
+		var extractErr error
+		sessionData, extractErr = s.extractSessionDataFromLiveTranscript(ctx, state)
+		if extractErr != nil {
+			return nil, fmt.Errorf("failed to extract session data from live transcript: %w", extractErr)
+		}
+	}
+
+	// Backfill session state token usage from the freshly-extracted transcript.
+	// Some agents (e.g., Copilot CLI) write aggregate token data (session.shutdown)
+	// AFTER all hooks return, so state.TokenUsage from turn-end only has fallback data.
+	// By condensation time, the transcript has the authoritative totals.
+	// Only replace when we got authoritative data (e.g., session.shutdown provides
+	// InputTokens; the fallback path only captures OutputTokens). This avoids
+	// overwriting accumulated multi-checkpoint totals with partial checkpoint data.
+	if sessionData.TokenUsage != nil && sessionData.TokenUsage.InputTokens > 0 {
+		state.TokenUsage = sessionData.TokenUsage
+	}
+
+	// For 1:1 checkpoint model: filter files_touched to only include files actually
+	// committed in this specific commit. This ensures each checkpoint represents
+	// exactly the files in that commit, not all files mentioned in the transcript.
+	if len(committedFiles) > 0 {
+		hadFilesBeforeFiltering := len(sessionData.FilesTouched) > 0
+
+		if hadFilesBeforeFiltering {
+			filtered := make([]string, 0, len(sessionData.FilesTouched))
+			for _, f := range sessionData.FilesTouched {
+				if _, ok := committedFiles[f]; ok {
+					filtered = append(filtered, f)
+				}
+			}
+			sessionData.FilesTouched = filtered
+		}
+
+		if len(sessionData.FilesTouched) == 0 && !hadFilesBeforeFiltering {
+			sessionData.FilesTouched = make([]string, 0, len(committedFiles))
+			for f := range committedFiles {
+				sessionData.FilesTouched = append(sessionData.FilesTouched, f)
+			}
+		}
 	}
 
 	// Get checkpoint store
@@ -136,36 +184,56 @@ func (s *ManualCommitStrategy) CondenseSession(repo *git.Repository, checkpointI
 
 	// Get author info
 	authorName, authorEmail := GetGitAuthorFromRepo(repo)
-	attribution := calculateSessionAttributions(repo, ref, sessionData, state)
+
+	// Determine attribution base commit
+	attrBase := state.AttributionBaseCommit
+	if attrBase == "" {
+		attrBase = state.BaseCommit
+	}
+
+	attribution := calculateSessionAttributions(ctx, repo, ref, sessionData, state, attributionOpts{
+		headTree:              o.headTree,
+		repoDir:               o.repoDir,
+		attributionBaseCommit: attrBase,
+		headCommitHash:        o.headCommitHash,
+	})
+
 	// Get current branch name
 	branchName := GetCurrentBranchName(repo)
 
 	// Generate summary if enabled
 	var summary *cpkg.Summary
-	if settings.IsSummarizeEnabled() && len(sessionData.Transcript) > 0 {
-		logCtx := logging.WithComponent(context.Background(), "attribution")
-		summarizeCtx := logging.WithComponent(logCtx, "summarize")
+	if settings.IsSummarizeEnabled(ctx) && len(sessionData.Transcript) > 0 {
+		summarizeCtx := logging.WithComponent(ctx, "summarize")
 
-		// Scope transcript to this checkpoint's portion.
-		// SliceFromLine only works for JSONL (Claude Code) transcripts where
-		// CheckpointTranscriptStart is a line offset. For Gemini JSON transcripts,
-		// CheckpointTranscriptStart is a message index and the transcript is a single
-		// JSON blob, so line-based slicing would produce malformed content.
-		// The summarizer (ParseFromBytes) only supports JSONL, so skip scoping for Gemini.
 		var scopedTranscript []byte
-		if state.AgentType == agent.AgentTypeGemini {
-			scopedTranscript = sessionData.Transcript
-		} else {
+		switch state.AgentType {
+		case agent.AgentTypeGemini:
+			scoped, sliceErr := geminicli.SliceFromMessage(sessionData.Transcript, state.CheckpointTranscriptStart)
+			if sliceErr != nil {
+				logging.Warn(summarizeCtx, "failed to scope Gemini transcript for summary",
+					slog.String("session_id", state.SessionID),
+					slog.String("error", sliceErr.Error()))
+			}
+			scopedTranscript = scoped
+		case agent.AgentTypeOpenCode:
+			scoped, sliceErr := opencode.SliceFromMessage(sessionData.Transcript, state.CheckpointTranscriptStart)
+			if sliceErr != nil {
+				logging.Warn(summarizeCtx, "failed to scope OpenCode transcript for summary",
+					slog.String("session_id", state.SessionID),
+					slog.String("error", sliceErr.Error()))
+			}
+			scopedTranscript = scoped
+		case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
 			scopedTranscript = transcript.SliceFromLine(sessionData.Transcript, state.CheckpointTranscriptStart)
 		}
 		if len(scopedTranscript) > 0 {
 			var err error
-			summary, err = summarize.GenerateFromTranscript(summarizeCtx, scopedTranscript, sessionData.FilesTouched, nil)
+			summary, err = summarize.GenerateFromTranscript(summarizeCtx, scopedTranscript, sessionData.FilesTouched, state.AgentType, nil)
 			if err != nil {
 				logging.Warn(summarizeCtx, "summary generation failed",
 					slog.String("session_id", state.SessionID),
 					slog.String("error", err.Error()))
-				// Continue without summary - non-blocking
 			} else {
 				logging.Info(summarizeCtx, "summary generated",
 					slog.String("session_id", state.SessionID))
@@ -174,26 +242,27 @@ func (s *ManualCommitStrategy) CondenseSession(repo *git.Repository, checkpointI
 	}
 
 	// Write checkpoint metadata using the checkpoint store
-	if err := store.WriteCommitted(context.Background(), cpkg.WriteCommittedOptions{
+	if err := store.WriteCommitted(ctx, cpkg.WriteCommittedOptions{
 		CheckpointID:                checkpointID,
 		SessionID:                   state.SessionID,
 		Strategy:                    StrategyNameManualCommit,
 		Branch:                      branchName,
 		Transcript:                  sessionData.Transcript,
 		Prompts:                     sessionData.Prompts,
-		Context:                     sessionData.Context,
 		FilesTouched:                sessionData.FilesTouched,
 		CheckpointsCount:            state.StepCount,
 		EphemeralBranch:             shadowBranchName,
 		AuthorName:                  authorName,
 		AuthorEmail:                 authorEmail,
 		Agent:                       state.AgentType,
+		Model:                       state.ModelName,
+		TurnID:                      state.TurnID,
 		TranscriptIdentifierAtStart: state.TranscriptIdentifierAtStart,
 		CheckpointTranscriptStart:   state.CheckpointTranscriptStart,
 		TokenUsage:                  sessionData.TokenUsage,
+		SessionMetrics:              buildSessionMetrics(state),
 		InitialAttribution:          attribution,
 		Summary:                     summary,
-		SessionTranscriptPath:       homeRelativePath(state.TranscriptPath),
 	}); err != nil {
 		return nil, fmt.Errorf("failed to write checkpoint metadata: %w", err)
 	}
@@ -203,101 +272,159 @@ func (s *ManualCommitStrategy) CondenseSession(repo *git.Repository, checkpointI
 		SessionID:            state.SessionID,
 		CheckpointsCount:     state.StepCount,
 		FilesTouched:         sessionData.FilesTouched,
+		Prompts:              sessionData.Prompts,
 		TotalTranscriptLines: sessionData.FullTranscriptLines,
+		Transcript:           sessionData.Transcript,
 	}, nil
 }
 
-func calculateSessionAttributions(repo *git.Repository, shadowRef *plumbing.Reference, sessionData *ExtractedSessionData, state *SessionState) *cpkg.InitialAttribution {
+// buildSessionMetrics creates a SessionMetrics from session state if any metrics are available.
+// Returns nil if no hook-provided metrics exist (e.g., for agents that don't report them).
+func buildSessionMetrics(state *SessionState) *cpkg.SessionMetrics {
+	if state.SessionDurationMs == 0 && state.SessionTurnCount == 0 && state.ContextTokens == 0 && state.ContextWindowSize == 0 {
+		return nil
+	}
+	return &cpkg.SessionMetrics{
+		DurationMs:        state.SessionDurationMs,
+		TurnCount:         state.SessionTurnCount,
+		ContextTokens:     state.ContextTokens,
+		ContextWindowSize: state.ContextWindowSize,
+	}
+}
+
+// attributionOpts provides pre-resolved git objects to avoid redundant reads.
+type attributionOpts struct {
+	headTree              *object.Tree // HEAD commit tree (already resolved by PostCommit)
+	shadowTree            *object.Tree // Shadow branch tree (already resolved by PostCommit)
+	repoDir               string       // Repository worktree path for git CLI commands
+	attributionBaseCommit string       // Base commit hash for non-agent file detection (empty = fall back to go-git tree walk)
+	headCommitHash        string       // HEAD commit hash for non-agent file detection (empty = fall back to go-git tree walk)
+}
+
+func calculateSessionAttributions(ctx context.Context, repo *git.Repository, shadowRef *plumbing.Reference, sessionData *ExtractedSessionData, state *SessionState, opts ...attributionOpts) *cpkg.InitialAttribution {
 	// Calculate initial attribution using accumulated prompt attribution data.
 	// This uses user edits captured at each prompt start (before agent works),
 	// plus any user edits after the final checkpoint (shadow → head).
-	logCtx := logging.WithComponent(context.Background(), "attribution")
-	var attribution *cpkg.InitialAttribution
-	headRef, headErr := repo.Head()
-	if headErr != nil {
-		logging.Debug(logCtx, "attribution skipped: failed to get HEAD",
-			slog.String("error", headErr.Error()))
-	} else {
+	//
+	// When shadowRef is nil (agent committed mid-turn before SaveStep),
+	// HEAD is used as the shadow tree. This is correct because the agent's
+	// commit IS HEAD — there are no user edits between agent work and commit.
+	logCtx := logging.WithComponent(ctx, "attribution")
+
+	var o attributionOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+
+	headTree := o.headTree
+	if headTree == nil {
+		headRef, headErr := repo.Head()
+		if headErr != nil {
+			logging.Debug(logCtx, "attribution skipped: failed to get HEAD",
+				slog.String("error", headErr.Error()))
+			return nil
+		}
+
 		headCommit, commitErr := repo.CommitObject(headRef.Hash())
 		if commitErr != nil {
 			logging.Debug(logCtx, "attribution skipped: failed to get HEAD commit",
 				slog.String("error", commitErr.Error()))
-		} else {
-			headTree, treeErr := headCommit.Tree()
-			if treeErr != nil {
-				logging.Debug(logCtx, "attribution skipped: failed to get HEAD tree",
-					slog.String("error", treeErr.Error()))
-			} else {
-				// Get shadow branch tree (checkpoint tree - what the agent wrote)
-				shadowCommit, shadowErr := repo.CommitObject(shadowRef.Hash())
-				if shadowErr != nil {
-					logging.Debug(logCtx, "attribution skipped: failed to get shadow commit",
-						slog.String("error", shadowErr.Error()),
-						slog.String("shadow_ref", shadowRef.Hash().String()))
-				} else {
-					shadowTree, shadowTreeErr := shadowCommit.Tree()
-					if shadowTreeErr != nil {
-						logging.Debug(logCtx, "attribution skipped: failed to get shadow tree",
-							slog.String("error", shadowTreeErr.Error()))
-					} else {
-						// Get base tree (state before session started)
-						var baseTree *object.Tree
-						attrBase := state.AttributionBaseCommit
-						if attrBase == "" {
-							attrBase = state.BaseCommit // backward compat
-						}
-						if baseCommit, baseErr := repo.CommitObject(plumbing.NewHash(attrBase)); baseErr == nil {
-							if tree, baseTErr := baseCommit.Tree(); baseTErr == nil {
-								baseTree = tree
-							} else {
-								logging.Debug(logCtx, "attribution: base tree unavailable",
-									slog.String("error", baseTErr.Error()))
-							}
-						} else {
-							logging.Debug(logCtx, "attribution: base commit unavailable",
-								slog.String("error", baseErr.Error()),
-								slog.String("attribution_base", attrBase))
-						}
+			return nil
+		}
 
-						// Log accumulated prompt attributions for debugging
-						var totalUserAdded, totalUserRemoved int
-						for i, pa := range state.PromptAttributions {
-							totalUserAdded += pa.UserLinesAdded
-							totalUserRemoved += pa.UserLinesRemoved
-							logging.Debug(logCtx, "prompt attribution data",
-								slog.Int("checkpoint", pa.CheckpointNumber),
-								slog.Int("user_added", pa.UserLinesAdded),
-								slog.Int("user_removed", pa.UserLinesRemoved),
-								slog.Int("agent_added", pa.AgentLinesAdded),
-								slog.Int("agent_removed", pa.AgentLinesRemoved),
-								slog.Int("index", i))
-						}
-
-						attribution = CalculateAttributionWithAccumulated(
-							baseTree,
-							shadowTree,
-							headTree,
-							sessionData.FilesTouched,
-							state.PromptAttributions,
-						)
-
-						if attribution != nil {
-							logging.Info(logCtx, "attribution calculated",
-								slog.Int("agent_lines", attribution.AgentLines),
-								slog.Int("human_added", attribution.HumanAdded),
-								slog.Int("human_modified", attribution.HumanModified),
-								slog.Int("human_removed", attribution.HumanRemoved),
-								slog.Int("total_committed", attribution.TotalCommitted),
-								slog.Float64("agent_percentage", attribution.AgentPercentage),
-								slog.Int("accumulated_user_added", totalUserAdded),
-								slog.Int("accumulated_user_removed", totalUserRemoved),
-								slog.Int("files_touched", len(sessionData.FilesTouched)))
-						}
-					}
-				}
-			}
+		var treeErr error
+		headTree, treeErr = headCommit.Tree()
+		if treeErr != nil {
+			logging.Debug(logCtx, "attribution skipped: failed to get HEAD tree",
+				slog.String("error", treeErr.Error()))
+			return nil
 		}
 	}
+
+	// Get shadow tree: from pre-resolved cache, shadow branch, or HEAD (agent committed directly).
+	shadowTree := o.shadowTree
+	if shadowTree == nil {
+		if shadowRef != nil {
+			shadowCommit, shadowErr := repo.CommitObject(shadowRef.Hash())
+			if shadowErr != nil {
+				logging.Debug(logCtx, "attribution skipped: failed to get shadow commit",
+					slog.String("error", shadowErr.Error()),
+					slog.String("shadow_ref", shadowRef.Hash().String()))
+				return nil
+			}
+			var shadowTreeErr error
+			shadowTree, shadowTreeErr = shadowCommit.Tree()
+			if shadowTreeErr != nil {
+				logging.Debug(logCtx, "attribution skipped: failed to get shadow tree",
+					slog.String("error", shadowTreeErr.Error()))
+				return nil
+			}
+		} else {
+			// No shadow branch: agent committed mid-turn. Use HEAD as shadow
+			// because the agent's work is the commit itself.
+			logging.Debug(logCtx, "attribution: using HEAD as shadow (no shadow branch)")
+			shadowTree = headTree
+		}
+	}
+
+	// Get base tree (state before session started)
+	var baseTree *object.Tree
+	attrBase := state.AttributionBaseCommit
+	if attrBase == "" {
+		attrBase = state.BaseCommit // backward compat
+	}
+	if baseCommit, baseErr := repo.CommitObject(plumbing.NewHash(attrBase)); baseErr == nil {
+		if tree, baseTErr := baseCommit.Tree(); baseTErr == nil {
+			baseTree = tree
+		} else {
+			logging.Debug(logCtx, "attribution: base tree unavailable",
+				slog.String("error", baseTErr.Error()))
+		}
+	} else {
+		logging.Debug(logCtx, "attribution: base commit unavailable",
+			slog.String("error", baseErr.Error()),
+			slog.String("attribution_base", attrBase))
+	}
+
+	// Log accumulated prompt attributions for debugging
+	var totalUserAdded, totalUserRemoved int
+	for i, pa := range state.PromptAttributions {
+		totalUserAdded += pa.UserLinesAdded
+		totalUserRemoved += pa.UserLinesRemoved
+		logging.Debug(logCtx, "prompt attribution data",
+			slog.Int("checkpoint", pa.CheckpointNumber),
+			slog.Int("user_added", pa.UserLinesAdded),
+			slog.Int("user_removed", pa.UserLinesRemoved),
+			slog.Int("agent_added", pa.AgentLinesAdded),
+			slog.Int("agent_removed", pa.AgentLinesRemoved),
+			slog.Int("index", i))
+	}
+
+	attribution := CalculateAttributionWithAccumulated(
+		ctx,
+		baseTree,
+		shadowTree,
+		headTree,
+		sessionData.FilesTouched,
+		state.PromptAttributions,
+		o.repoDir,
+		o.attributionBaseCommit,
+		o.headCommitHash,
+	)
+
+	if attribution != nil {
+		logging.Info(logCtx, "attribution calculated",
+			slog.Int("agent_lines", attribution.AgentLines),
+			slog.Int("human_added", attribution.HumanAdded),
+			slog.Int("human_modified", attribution.HumanModified),
+			slog.Int("human_removed", attribution.HumanRemoved),
+			slog.Int("total_committed", attribution.TotalCommitted),
+			slog.Float64("agent_percentage", attribution.AgentPercentage),
+			slog.Int("accumulated_user_added", totalUserAdded),
+			slog.Int("accumulated_user_removed", totalUserRemoved),
+			slog.Int("files_touched", len(sessionData.FilesTouched)))
+	}
+
 	return attribution
 }
 
@@ -305,10 +432,11 @@ func calculateSessionAttributions(repo *git.Repository, shadowRef *plumbing.Refe
 // filesTouched is the list of files tracked during the session (from SessionState.FilesTouched).
 // agentType identifies the agent (e.g., "Gemini CLI", "Claude Code") to determine transcript format.
 // liveTranscriptPath, when non-empty and readable, is preferred over the shadow branch copy.
-// This handles the case where SaveChanges was skipped (no code changes) but the transcript
+// This handles the case where SaveStep was skipped (no code changes) but the transcript
 // continued growing — the shadow branch copy would be stale.
 // checkpointTranscriptStart is the line offset (Claude) or message index (Gemini) where the current checkpoint began.
-func (s *ManualCommitStrategy) extractSessionData(repo *git.Repository, shadowRef plumbing.Hash, sessionID string, filesTouched []string, agentType agent.AgentType, liveTranscriptPath string, checkpointTranscriptStart int) (*ExtractedSessionData, error) {
+func (s *ManualCommitStrategy) extractSessionData(ctx context.Context, repo *git.Repository, shadowRef plumbing.Hash, sessionID string, filesTouched []string, agentType types.AgentType, liveTranscriptPath string, checkpointTranscriptStart int, isActive bool) (*ExtractedSessionData, error) {
+	ag, _ := agent.GetByAgentType(agentType) //nolint:errcheck // ag may be nil for unknown agent types; callers use type assertions so nil is safe
 	commit, err := repo.CommitObject(shadowRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get commit object: %w", err)
@@ -325,9 +453,15 @@ func (s *ManualCommitStrategy) extractSessionData(repo *git.Repository, shadowRe
 
 	// Extract transcript — prefer the live file when available, fall back to shadow branch.
 	// The shadow branch copy may be stale if the last turn ended without code changes
-	// (SaveChanges is only called when there are file modifications).
+	// (SaveStep is only called when there are file modifications).
 	var fullTranscript string
 	if liveTranscriptPath != "" {
+		// Ensure transcript file exists (OpenCode creates it lazily via `opencode export`).
+		// Only wait for flush when the session is active — for idle/ended sessions the
+		// transcript is already fully flushed (the Stop hook completed the flush).
+		if isActive {
+			prepareTranscriptIfNeeded(ctx, ag, liveTranscriptPath)
+		}
 		if liveData, readErr := os.ReadFile(liveTranscriptPath); readErr == nil && len(liveData) > 0 { //nolint:gosec // path from session state
 			fullTranscript = string(liveData)
 		}
@@ -349,8 +483,16 @@ func (s *ManualCommitStrategy) extractSessionData(repo *git.Repository, shadowRe
 	if fullTranscript != "" {
 		data.Transcript = []byte(fullTranscript)
 		data.FullTranscriptLines = countTranscriptItems(agentType, fullTranscript)
-		data.Prompts = extractUserPrompts(agentType, fullTranscript)
-		data.Context = generateContextFromPrompts(data.Prompts)
+		// Read prompts from shadow branch tree (source of truth after SaveStep)
+		if file, fileErr := tree.File(metadataDir + "/" + paths.PromptFileName); fileErr == nil {
+			if content, contentErr := file.Contents(); contentErr == nil && content != "" {
+				data.Prompts = splitPromptContent(content)
+			}
+		}
+		// Filesystem fallback (written at turn start, covers mid-turn commits)
+		if len(data.Prompts) == 0 {
+			data.Prompts = readPromptsFromFilesystem(ctx, sessionID)
+		}
 	}
 
 	// Use tracked files from session state (not all files in tree)
@@ -358,7 +500,44 @@ func (s *ManualCommitStrategy) extractSessionData(repo *git.Repository, shadowRe
 
 	// Calculate token usage from the extracted transcript portion
 	if len(data.Transcript) > 0 {
-		data.TokenUsage = calculateTokenUsage(agentType, data.Transcript, checkpointTranscriptStart)
+		data.TokenUsage = agent.CalculateTokenUsage(ctx, ag, data.Transcript, checkpointTranscriptStart, "") //TODO: why do we not use here subagents dir?
+	}
+
+	return data, nil
+}
+
+// extractSessionDataFromLiveTranscript extracts session data directly from the live transcript file.
+// This is used for mid-session commits where no shadow branch exists yet.
+func (s *ManualCommitStrategy) extractSessionDataFromLiveTranscript(ctx context.Context, state *SessionState) (*ExtractedSessionData, error) {
+	data := &ExtractedSessionData{}
+
+	ag, _ := agent.GetByAgentType(state.AgentType) //nolint:errcheck // ag may be nil for unknown agent types; callers use type assertions so nil is safe
+
+	// Read the live transcript
+	if state.TranscriptPath == "" {
+		return nil, errors.New("no transcript path in session state")
+	}
+
+	liveData, err := os.ReadFile(state.TranscriptPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read live transcript: %w", err)
+	}
+
+	if len(liveData) == 0 {
+		return nil, errors.New("live transcript is empty")
+	}
+
+	fullTranscript := string(liveData)
+	data.Transcript = liveData
+	data.FullTranscriptLines = countTranscriptItems(state.AgentType, fullTranscript)
+	data.Prompts = readPromptsFromFilesystem(ctx, state.SessionID)
+
+	// Resolve files touched: prefers hook-populated state, falls back to transcript extraction
+	data.FilesTouched = s.resolveFilesTouched(ctx, state)
+
+	// Calculate token usage from the extracted transcript portion
+	if len(data.Transcript) > 0 {
+		data.TokenUsage = agent.CalculateTokenUsage(ctx, ag, data.Transcript, state.CheckpointTranscriptStart, "") //TODO: why do we not use here subagents dir?
 	}
 
 	return data, nil
@@ -366,10 +545,19 @@ func (s *ManualCommitStrategy) extractSessionData(repo *git.Repository, shadowRe
 
 // countTranscriptItems counts lines (JSONL) or messages (JSON) in a transcript.
 // For Claude Code and JSONL-based agents, this counts lines.
-// For Gemini CLI and JSON-based agents, this counts messages.
+// For Gemini CLI, OpenCode, and JSON-based agents, this counts messages.
 // Returns 0 if the content is empty or malformed.
-func countTranscriptItems(agentType agent.AgentType, content string) int {
+func countTranscriptItems(agentType types.AgentType, content string) int {
 	if content == "" {
+		return 0
+	}
+
+	// OpenCode uses export JSON format with {"info": {...}, "messages": [...]}
+	if agentType == agent.AgentTypeOpenCode {
+		session, err := opencode.ParseExportSession([]byte(content))
+		if err == nil && session != nil {
+			return len(session.Messages)
+		}
 		return 0
 	}
 
@@ -397,8 +585,43 @@ func countTranscriptItems(agentType agent.AgentType, content string) int {
 
 // extractUserPrompts extracts all user prompts from transcript content.
 // Returns prompts with IDE context tags stripped (e.g., <ide_opened_file>).
-func extractUserPrompts(agentType agent.AgentType, content string) []string {
+func extractUserPrompts(agentType types.AgentType, content string) []string {
 	if content == "" {
+		return nil
+	}
+
+	// Droid has its own envelope format — use its parser to normalize first
+	if agentType == agent.AgentTypeFactoryAIDroid {
+		lines, _, err := factoryaidroid.ParseDroidTranscriptFromBytes([]byte(content), 0)
+		if err != nil {
+			return nil
+		}
+		var prompts []string
+		for _, line := range lines {
+			if line.Type != transcript.TypeUser {
+				continue
+			}
+			if text := transcript.ExtractUserContent(line.Message); text != "" {
+				if stripped := textutil.StripIDEContextTags(text); stripped != "" {
+					prompts = append(prompts, stripped)
+				}
+			}
+		}
+		return prompts
+	}
+
+	// OpenCode uses JSONL with a different per-line schema than Claude Code
+	if agentType == agent.AgentTypeOpenCode {
+		prompts, err := opencode.ExtractAllUserPrompts([]byte(content))
+		if err == nil && len(prompts) > 0 {
+			cleaned := make([]string, 0, len(prompts))
+			for _, prompt := range prompts {
+				if stripped := textutil.StripIDEContextTags(prompt); stripped != "" {
+					cleaned = append(cleaned, stripped)
+				}
+			}
+			return cleaned
+		}
 		return nil
 	}
 
@@ -426,41 +649,6 @@ func extractUserPrompts(agentType agent.AgentType, content string) []string {
 	return extractUserPromptsFromLines(strings.Split(content, "\n"))
 }
 
-// calculateTokenUsage calculates token usage from raw transcript data.
-// startOffset is the line number (Claude Code) or message index (Gemini CLI)
-// where the current checkpoint began, allowing calculation for only the portion
-// of the transcript since the last checkpoint.
-func calculateTokenUsage(agentType agent.AgentType, data []byte, startOffset int) *agent.TokenUsage {
-	if len(data) == 0 {
-		return &agent.TokenUsage{}
-	}
-
-	// Try Gemini format first if agentType is Gemini, or as fallback if Unknown
-	if agentType == agent.AgentTypeGemini || agentType == agent.AgentTypeUnknown {
-		// Attempt to parse as Gemini JSON
-		transcript, err := geminicli.ParseTranscript(data)
-		if err == nil && transcript != nil && len(transcript.Messages) > 0 {
-			return geminicli.CalculateTokenUsage(data, startOffset)
-		}
-		// If agentType is explicitly Gemini but parsing failed, return empty usage
-		if agentType == agent.AgentTypeGemini {
-			return &agent.TokenUsage{}
-		}
-		// Otherwise fall through to JSONL parsing for Unknown type
-	}
-
-	// Claude Code and other JSONL-based agents
-	lines, err := claudecode.ParseTranscript(data)
-	if err != nil || len(lines) == 0 {
-		return &agent.TokenUsage{}
-	}
-	// Slice transcript lines to only include checkpoint portion
-	if startOffset > 0 && startOffset < len(lines) {
-		lines = lines[startOffset:]
-	}
-	return claudecode.CalculateTokenUsage(lines)
-}
-
 // extractUserPromptsFromLines extracts user prompts from JSONL transcript lines.
 // IDE-injected context tags (like <ide_opened_file>) are stripped from the results.
 func extractUserPromptsFromLines(lines []string) []string {
@@ -476,9 +664,13 @@ func extractUserPromptsFromLines(lines []string) []string {
 			continue
 		}
 
-		// Check for user message (supports both "human" and "user" types)
-		msgType, ok := entry["type"].(string)
-		if !ok || (msgType != "human" && msgType != "user") {
+		// Check for user message:
+		// - Claude Code uses "type": "human" or "type": "user"
+		// - Cursor uses "role": "user"
+		msgType, _ := entry["type"].(string) //nolint:errcheck // type assertion on interface{} from JSON
+		msgRole, _ := entry["role"].(string) //nolint:errcheck // type assertion on interface{} from JSON
+		isUser := msgType == "human" || msgType == "user" || msgRole == "user"
+		if !isUser {
 			continue
 		}
 
@@ -520,37 +712,58 @@ func extractUserPromptsFromLines(lines []string) []string {
 	return prompts
 }
 
-// generateContextFromPrompts generates context.md content from a list of prompts.
-func generateContextFromPrompts(prompts []string) []byte {
-	if len(prompts) == 0 {
+// splitPromptContent splits prompt.txt content on the "\n\n---\n\n" separator.
+// Returns nil if content is empty.
+func splitPromptContent(content string) []string {
+	if content == "" {
 		return nil
 	}
-
-	var buf strings.Builder
-	buf.WriteString("# Session Context\n\n")
-	buf.WriteString("## User Prompts\n\n")
-
-	for i, prompt := range prompts {
-		// Truncate very long prompts for readability
-		displayPrompt := prompt
-		if len(displayPrompt) > 500 {
-			displayPrompt = displayPrompt[:500] + "..."
+	parts := strings.Split(content, "\n\n---\n\n")
+	var result []string
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			result = append(result, trimmed)
 		}
-		buf.WriteString(fmt.Sprintf("### Prompt %d\n\n", i+1))
-		buf.WriteString(displayPrompt)
-		buf.WriteString("\n\n")
 	}
+	return result
+}
 
-	return []byte(buf.String())
+// readPromptsFromFilesystem reads prompt.txt from the filesystem session metadata directory.
+// This file is written at turn start and updated at each SaveStep, providing prompt data
+// even for mid-turn commits where the shadow branch may not have been updated.
+func readPromptsFromFilesystem(ctx context.Context, sessionID string) []string {
+	sessionDir := paths.SessionMetadataDirFromSessionID(sessionID)
+	sessionDirAbs, err := paths.AbsPath(ctx, sessionDir)
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(sessionDirAbs, paths.PromptFileName)) //nolint:gosec // path from session ID
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	return splitPromptContent(string(data))
+}
+
+// clearFilesystemPrompt removes the filesystem prompt.txt for a session.
+// Called after condensation so subsequent checkpoints start fresh.
+func clearFilesystemPrompt(ctx context.Context, sessionID string) {
+	sessionDir := paths.SessionMetadataDirFromSessionID(sessionID)
+	sessionDirAbs, err := paths.AbsPath(ctx, sessionDir)
+	if err != nil {
+		return
+	}
+	promptPath := filepath.Join(sessionDirAbs, paths.PromptFileName)
+	_ = os.Remove(promptPath)
 }
 
 // CondenseSessionByID force-condenses a session by its ID and cleans up.
 // This is used by "entire doctor" to salvage stuck sessions.
-func (s *ManualCommitStrategy) CondenseSessionByID(sessionID string) error {
-	ctx := logging.WithComponent(context.Background(), "condense-by-id")
+func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionID string) error {
+	logCtx := logging.WithComponent(ctx, "condense-by-id")
 
 	// Load session state
-	state, err := s.loadSessionState(sessionID)
+	state, err := s.loadSessionState(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to load session state: %w", err)
 	}
@@ -559,7 +772,7 @@ func (s *ManualCommitStrategy) CondenseSessionByID(sessionID string) error {
 	}
 
 	// Open repository
-	repo, err := OpenRepository()
+	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to open repository: %w", err)
 	}
@@ -579,23 +792,23 @@ func (s *ManualCommitStrategy) CondenseSessionByID(sessionID string) error {
 	if !hasShadowBranch {
 		// No shadow branch means no checkpoint data to condense.
 		// Just clean up the state file.
-		logging.Info(ctx, "no shadow branch for session, clearing state only",
+		logging.Info(logCtx, "no shadow branch for session, clearing state only",
 			slog.String("session_id", sessionID),
 			slog.String("shadow_branch", shadowBranchName),
 		)
-		if err := s.clearSessionState(sessionID); err != nil {
+		if err := s.clearSessionState(ctx, sessionID); err != nil {
 			return fmt.Errorf("failed to clear session state: %w", err)
 		}
 		return nil
 	}
 
 	// Condense the session
-	result, err := s.CondenseSession(repo, checkpointID, state)
+	result, err := s.CondenseSession(ctx, repo, checkpointID, state, nil)
 	if err != nil {
 		return fmt.Errorf("failed to condense session: %w", err)
 	}
 
-	logging.Info(ctx, "session condensed by ID",
+	logging.Info(logCtx, "session condensed by ID",
 		slog.String("session_id", sessionID),
 		slog.String("checkpoint_id", result.CheckpointID.String()),
 		slog.Int("checkpoints_condensed", result.CheckpointsCount),
@@ -606,18 +819,17 @@ func (s *ManualCommitStrategy) CondenseSessionByID(sessionID string) error {
 	state.CheckpointTranscriptStart = result.TotalTranscriptLines
 	state.Phase = session.PhaseIdle
 	state.LastCheckpointID = checkpointID
-	state.PendingCheckpointID = "" // Clear after condensation (amend handler uses LastCheckpointID)
 	state.AttributionBaseCommit = state.BaseCommit
 	state.PromptAttributions = nil
 	state.PendingPromptAttribution = nil
 
-	if err := s.saveSessionState(state); err != nil {
+	if err := s.saveSessionState(ctx, state); err != nil {
 		return fmt.Errorf("failed to save session state: %w", err)
 	}
 
 	// Clean up shadow branch if no other sessions need it
-	if err := s.cleanupShadowBranchIfUnused(repo, shadowBranchName, sessionID); err != nil {
-		logging.Warn(ctx, "failed to clean up shadow branch",
+	if err := s.cleanupShadowBranchIfUnused(ctx, repo, shadowBranchName, sessionID); err != nil {
+		logging.Warn(logCtx, "failed to clean up shadow branch",
 			slog.String("shadow_branch", shadowBranchName),
 			slog.String("error", err.Error()),
 		)
@@ -628,9 +840,9 @@ func (s *ManualCommitStrategy) CondenseSessionByID(sessionID string) error {
 }
 
 // cleanupShadowBranchIfUnused deletes a shadow branch if no other active sessions reference it.
-func (s *ManualCommitStrategy) cleanupShadowBranchIfUnused(_ *git.Repository, shadowBranchName, excludeSessionID string) error {
+func (s *ManualCommitStrategy) cleanupShadowBranchIfUnused(ctx context.Context, _ *git.Repository, shadowBranchName, excludeSessionID string) error {
 	// List all session states to check if any other session uses this shadow branch
-	allStates, err := s.listAllSessionStates()
+	allStates, err := s.listAllSessionStates(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list session states: %w", err)
 	}
@@ -648,7 +860,7 @@ func (s *ManualCommitStrategy) cleanupShadowBranchIfUnused(_ *git.Repository, sh
 
 	// No other sessions need it, delete the shadow branch via CLI
 	// (go-git v5's RemoveReference doesn't persist with packed refs/worktrees)
-	if err := DeleteBranchCLI(shadowBranchName); err != nil {
+	if err := DeleteBranchCLI(ctx, shadowBranchName); err != nil {
 		// Branch already gone is not an error
 		if errors.Is(err, ErrBranchNotFound) {
 			return nil

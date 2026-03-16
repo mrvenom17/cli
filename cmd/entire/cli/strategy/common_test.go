@@ -8,9 +8,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
+
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 func TestOpenRepository(t *testing.T) {
@@ -51,13 +55,13 @@ func TestOpenRepository(t *testing.T) {
 	t.Chdir(tmpDir)
 
 	// Test OpenRepository
-	openedRepo, err := OpenRepository()
+	openedRepo, err := OpenRepository(context.Background())
 	if err != nil {
-		t.Fatalf("OpenRepository() failed: %v", err)
+		t.Fatalf("OpenRepository(context.Background()) failed: %v", err)
 	}
 
 	if openedRepo == nil {
-		t.Fatal("OpenRepository() returned nil repository")
+		t.Fatal("OpenRepository(context.Background()) returned nil repository")
 	}
 
 	// Verify we can perform basic operations
@@ -89,9 +93,155 @@ func TestOpenRepositoryError(t *testing.T) {
 	t.Chdir(tmpDir)
 
 	// Test OpenRepository should fail
-	_, err := OpenRepository()
+	_, err := OpenRepository(context.Background())
 	if err == nil {
-		t.Fatal("OpenRepository() should have failed in non-repository directory")
+		t.Fatal("OpenRepository(context.Background()) should have failed in non-repository directory")
+	}
+}
+
+func TestWorktreeRoot_Cache(t *testing.T) {
+	// Uses t.Chdir + t.Setenv so cannot be parallel.
+	tmpDir := t.TempDir()
+	initTestRepo(t, tmpDir)
+	t.Chdir(tmpDir)
+	paths.ClearWorktreeRootCache()
+
+	// First call populates the cache via git.
+	got, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) first call error: %v", err)
+	}
+
+	// Resolve symlinks for comparison (macOS /var -> /private/var).
+	want, err := filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) = %q, want %q", got, want)
+	}
+
+	// Break git by pointing PATH at an empty directory.
+	// If the second call hits git it will fail.
+	emptyDir := t.TempDir()
+	t.Setenv("PATH", emptyDir)
+
+	got2, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) cached call should succeed, got error: %v", err)
+	}
+	if got2 != want {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) cached = %q, want %q", got2, want)
+	}
+
+	// After clearing the cache the broken PATH should cause a failure.
+	paths.ClearWorktreeRootCache()
+	_, err = paths.WorktreeRoot(context.Background())
+	if err == nil {
+		t.Fatal("paths.WorktreeRoot(context.Background()) should fail after cache clear with broken PATH")
+	}
+}
+
+func TestWorktreeRoot_MainRepo(t *testing.T) {
+	// In a normal (non-worktree) repo, WorktreeRoot returns the repo root.
+	// Uses t.Chdir so cannot be parallel.
+	tmpDir := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	tmpDir = resolved
+
+	initTestRepo(t, tmpDir)
+	t.Chdir(tmpDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) error: %v", err)
+	}
+	if got != tmpDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) = %q, want repo root %q", got, tmpDir)
+	}
+
+	// Also works from a subdirectory.
+	subDir := filepath.Join(tmpDir, "sub", "dir")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+	t.Chdir(subDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err = paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) from subdir error: %v", err)
+	}
+	if got != tmpDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) from subdir = %q, want repo root %q", got, tmpDir)
+	}
+}
+
+func TestWorktreeRoot_Worktree(t *testing.T) {
+	// In a git worktree, WorktreeRoot must return the worktree's own root,
+	// NOT the main repository root. The worktree is placed in a separate
+	// temp directory (sibling, not child) so the two paths share no prefix.
+	// Uses t.Chdir so cannot be parallel.
+	mainDir := t.TempDir()
+	mainResolved, err := filepath.EvalSymlinks(mainDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	mainDir = mainResolved
+
+	initTestRepo(t, mainDir)
+
+	worktreeDir := t.TempDir()
+	wtResolved, err := filepath.EvalSymlinks(worktreeDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	worktreeDir = wtResolved
+
+	// t.TempDir() creates the directory; git worktree add needs it to not exist.
+	if err := os.Remove(worktreeDir); err != nil {
+		t.Fatalf("failed to remove temp dir for worktree: %v", err)
+	}
+	if err := createWorktree(mainDir, worktreeDir, "wt-branch"); err != nil {
+		t.Fatalf("failed to create worktree: %v", err)
+	}
+	t.Cleanup(func() { removeWorktree(mainDir, worktreeDir) })
+
+	t.Chdir(worktreeDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) error: %v", err)
+	}
+	if got != worktreeDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) = %q, want worktree root %q", got, worktreeDir)
+	}
+	if got == mainDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) returned main repo root %q, must return worktree root", mainDir)
+	}
+
+	// Also works from a subdirectory within the worktree.
+	subDir := filepath.Join(worktreeDir, "deep", "sub")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+	t.Chdir(subDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err = paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) from worktree subdir error: %v", err)
+	}
+	if got != worktreeDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) from worktree subdir = %q, want %q", got, worktreeDir)
+	}
+	if got == mainDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) from worktree subdir returned main repo root %q", mainDir)
 	}
 }
 
@@ -101,8 +251,8 @@ func TestIsInsideWorktree(t *testing.T) {
 		initTestRepo(t, tmpDir)
 		t.Chdir(tmpDir)
 
-		if IsInsideWorktree() {
-			t.Error("IsInsideWorktree() should return false in main repo")
+		if IsInsideWorktree(context.Background()) {
+			t.Error("IsInsideWorktree(context.Background()) should return false in main repo")
 		}
 	})
 
@@ -121,8 +271,8 @@ func TestIsInsideWorktree(t *testing.T) {
 
 		t.Chdir(worktreeDir)
 
-		if !IsInsideWorktree() {
-			t.Error("IsInsideWorktree() should return true in worktree")
+		if !IsInsideWorktree(context.Background()) {
+			t.Error("IsInsideWorktree(context.Background()) should return true in worktree")
 		}
 	})
 
@@ -130,8 +280,8 @@ func TestIsInsideWorktree(t *testing.T) {
 		tmpDir := t.TempDir()
 		t.Chdir(tmpDir)
 
-		if IsInsideWorktree() {
-			t.Error("IsInsideWorktree() should return false in non-repo")
+		if IsInsideWorktree(context.Background()) {
+			t.Error("IsInsideWorktree(context.Background()) should return false in non-repo")
 		}
 	})
 }
@@ -150,13 +300,13 @@ func TestGetMainRepoRoot(t *testing.T) {
 		initTestRepo(t, tmpDir)
 		t.Chdir(tmpDir)
 
-		root, err := GetMainRepoRoot()
+		root, err := GetMainRepoRoot(context.Background())
 		if err != nil {
-			t.Fatalf("GetMainRepoRoot() failed: %v", err)
+			t.Fatalf("GetMainRepoRoot(context.Background()) failed: %v", err)
 		}
 
 		if root != tmpDir {
-			t.Errorf("GetMainRepoRoot() = %q, want %q", root, tmpDir)
+			t.Errorf("GetMainRepoRoot(context.Background()) = %q, want %q", root, tmpDir)
 		}
 	})
 
@@ -181,13 +331,13 @@ func TestGetMainRepoRoot(t *testing.T) {
 
 		t.Chdir(worktreeDir)
 
-		root, err := GetMainRepoRoot()
+		root, err := GetMainRepoRoot(context.Background())
 		if err != nil {
-			t.Fatalf("GetMainRepoRoot() failed: %v", err)
+			t.Fatalf("GetMainRepoRoot(context.Background()) failed: %v", err)
 		}
 
 		if root != tmpDir {
-			t.Errorf("GetMainRepoRoot() = %q, want %q", root, tmpDir)
+			t.Errorf("GetMainRepoRoot(context.Background()) = %q, want %q", root, tmpDir)
 		}
 	})
 }
@@ -705,6 +855,114 @@ func resetProtectedDirsForTest() {
 	protectedDirsCache = nil
 }
 
+func TestGetGitAuthorFromRepo(t *testing.T) {
+	// Cannot use t.Parallel() because subtests use t.Setenv to isolate global git config.
+
+	tests := []struct {
+		name        string
+		localName   string
+		localEmail  string
+		globalName  string
+		globalEmail string
+		wantName    string
+		wantEmail   string
+	}{
+		{
+			name:       "both set locally",
+			localName:  "Local User",
+			localEmail: "local@example.com",
+			wantName:   "Local User",
+			wantEmail:  "local@example.com",
+		},
+		{
+			name:        "only name set locally falls back to global for email",
+			localName:   "Local User",
+			globalEmail: "global@example.com",
+			wantName:    "Local User",
+			wantEmail:   "global@example.com",
+		},
+		{
+			name:       "only email set locally falls back to global for name",
+			localEmail: "local@example.com",
+			globalName: "Global User",
+			wantName:   "Global User",
+			wantEmail:  "local@example.com",
+		},
+		{
+			name:        "nothing set locally falls back to global for both",
+			globalName:  "Global User",
+			globalEmail: "global@example.com",
+			wantName:    "Global User",
+			wantEmail:   "global@example.com",
+		},
+		{
+			name:      "nothing set anywhere returns defaults",
+			wantName:  "Unknown",
+			wantEmail: "unknown@local",
+		},
+		{
+			name:        "local takes precedence over global",
+			localName:   "Local User",
+			localEmail:  "local@example.com",
+			globalName:  "Global User",
+			globalEmail: "global@example.com",
+			wantName:    "Local User",
+			wantEmail:   "local@example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Isolate global git config by pointing HOME to a temp dir
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", "")
+
+			// Write global .gitconfig if needed
+			if tt.globalName != "" || tt.globalEmail != "" {
+				globalCfg := "[user]\n"
+				if tt.globalName != "" {
+					globalCfg += "\tname = " + tt.globalName + "\n"
+				}
+				if tt.globalEmail != "" {
+					globalCfg += "\temail = " + tt.globalEmail + "\n"
+				}
+				if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(globalCfg), 0o644); err != nil {
+					t.Fatalf("failed to write global gitconfig: %v", err)
+				}
+			}
+
+			// Create a repo for config resolution
+			dir := t.TempDir()
+			repo, err := git.PlainInit(dir, false)
+			if err != nil {
+				t.Fatalf("failed to init repo: %v", err)
+			}
+
+			// Set local config if needed
+			if tt.localName != "" || tt.localEmail != "" {
+				cfg, err := repo.Config()
+				if err != nil {
+					t.Fatalf("failed to get repo config: %v", err)
+				}
+				cfg.User.Name = tt.localName
+				cfg.User.Email = tt.localEmail
+				if err := repo.SetConfig(cfg); err != nil {
+					t.Fatalf("failed to set repo config: %v", err)
+				}
+			}
+
+			gotName, gotEmail := GetGitAuthorFromRepo(repo)
+			if gotName != tt.wantName {
+				t.Errorf("name = %q, want %q", gotName, tt.wantName)
+			}
+			if gotEmail != tt.wantEmail {
+				t.Errorf("email = %q, want %q", gotEmail, tt.wantEmail)
+			}
+		})
+	}
+}
+
 func TestIsProtectedPath(t *testing.T) {
 	t.Parallel()
 
@@ -734,6 +992,511 @@ func TestIsProtectedPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// initBareWithMetadataBranch creates a bare repo with a main branch and an
+// entire/checkpoints/v1 branch containing checkpoint data via git CLI.
+func initBareWithMetadataBranch(t *testing.T) string {
+	t.Helper()
+	bareDir := t.TempDir()
+
+	// Init bare, create main branch with a commit
+	workDir := t.TempDir()
+	run := func(dir string, args ...string) {
+		cmd := exec.CommandContext(context.Background(), "git", args...)
+		cmd.Dir = dir
+		cmd.Env = testutil.GitIsolatedEnv()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+	run(bareDir, "init", "--bare", "-b", "main")
+	run(workDir, "clone", bareDir, ".")
+	run(workDir, "config", "user.email", "test@test.com")
+	run(workDir, "config", "user.name", "Test User")
+	run(workDir, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Test"), 0o644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run(workDir, "add", ".")
+	run(workDir, "commit", "-m", "init")
+	run(workDir, "push", "origin", "main")
+
+	// Create orphan entire/checkpoints/v1 with data
+	run(workDir, "checkout", "--orphan", paths.MetadataBranchName)
+	run(workDir, "rm", "-rf", ".")
+	if err := os.WriteFile(filepath.Join(workDir, "metadata.json"), []byte(`{"checkpoint_id":"test123"}`), 0o644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run(workDir, "add", ".")
+	run(workDir, "commit", "-m", "Checkpoint: test123")
+	run(workDir, "push", "origin", paths.MetadataBranchName)
+
+	return bareDir
+}
+
+func TestEnsureMetadataBranch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("creates from remote on fresh clone", func(t *testing.T) {
+		bareDir := initBareWithMetadataBranch(t)
+		cloneDir := filepath.Join(t.TempDir(), "clone")
+		cmd := exec.CommandContext(context.Background(), "git", "clone", bareDir, cloneDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("clone failed: %v\n%s", err, out)
+		}
+
+		repo, err := git.PlainOpen(cloneDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		if err := EnsureMetadataBranch(repo); err != nil {
+			t.Fatalf("EnsureMetadataBranch() failed: %v", err)
+		}
+
+		// Local branch should exist with data (not empty)
+		ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+		if err != nil {
+			t.Fatalf("local branch not found: %v", err)
+		}
+		commit, err := repo.CommitObject(ref.Hash())
+		if err != nil {
+			t.Fatalf("failed to get commit: %v", err)
+		}
+		tree, err := commit.Tree()
+		if err != nil {
+			t.Fatalf("failed to get tree: %v", err)
+		}
+		if len(tree.Entries) == 0 {
+			t.Error("local branch has empty tree — remote data was not preserved")
+		}
+	})
+
+	t.Run("updates empty orphan from remote", func(t *testing.T) {
+		t.Parallel()
+		bareDir := initBareWithMetadataBranch(t)
+		cloneDir := filepath.Join(t.TempDir(), "clone")
+		cmd := exec.CommandContext(context.Background(), "git", "clone", bareDir, cloneDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("clone failed: %v\n%s", err, out)
+		}
+
+		repo, err := git.PlainOpen(cloneDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create an empty orphan locally (simulates old enable behavior)
+		emptyTree := &object.Tree{Entries: []object.TreeEntry{}}
+		treeObj := repo.Storer.NewEncodedObject()
+		if err := emptyTree.Encode(treeObj); err != nil {
+			t.Fatalf("failed to encode tree: %v", err)
+		}
+		treeHash, err := repo.Storer.SetEncodedObject(treeObj)
+		if err != nil {
+			t.Fatalf("failed to store tree: %v", err)
+		}
+		orphan := &object.Commit{
+			TreeHash: treeHash,
+			Author:   object.Signature{Name: "Test", Email: "test@test.com"},
+			Message:  "Initialize metadata branch\n",
+		}
+		orphanObj := repo.Storer.NewEncodedObject()
+		if err := orphan.Encode(orphanObj); err != nil {
+			t.Fatalf("failed to encode commit: %v", err)
+		}
+		orphanHash, err := repo.Storer.SetEncodedObject(orphanObj)
+		if err != nil {
+			t.Fatalf("failed to store commit: %v", err)
+		}
+		refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+		if err := repo.Storer.SetReference(plumbing.NewHashReference(refName, orphanHash)); err != nil {
+			t.Fatalf("failed to set ref: %v", err)
+		}
+
+		if err := EnsureMetadataBranch(repo); err != nil {
+			t.Fatalf("EnsureMetadataBranch() failed: %v", err)
+		}
+
+		// Should have been updated from remote — no longer empty
+		ref, err := repo.Reference(refName, true)
+		if err != nil {
+			t.Fatalf("local branch not found: %v", err)
+		}
+		if ref.Hash() == orphanHash {
+			t.Error("local branch still points to empty orphan — was not updated from remote")
+		}
+	})
+
+	t.Run("creates empty orphan when no remote", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		initTestRepo(t, dir)
+		repo, err := git.PlainOpen(dir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		if err := EnsureMetadataBranch(repo); err != nil {
+			t.Fatalf("EnsureMetadataBranch() failed: %v", err)
+		}
+
+		ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+		if err != nil {
+			t.Fatalf("branch not found: %v", err)
+		}
+		commit, err := repo.CommitObject(ref.Hash())
+		if err != nil {
+			t.Fatalf("failed to get commit: %v", err)
+		}
+		tree, err := commit.Tree()
+		if err != nil {
+			t.Fatalf("failed to get tree: %v", err)
+		}
+		if len(tree.Entries) != 0 {
+			t.Errorf("expected empty tree, got %d entries", len(tree.Entries))
+		}
+	})
+}
+
+// cloneWithConfig clones bareDir into a new temp directory, configures git identity,
+// and returns the clone path and a git runner function.
+func cloneWithConfig(t *testing.T, bareDir string) (string, func(args ...string)) {
+	t.Helper()
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	cmd := exec.CommandContext(context.Background(), "git", "clone", bareDir, cloneDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone failed: %v\n%s", err, out)
+	}
+	run := func(args ...string) {
+		cmd := exec.CommandContext(context.Background(), "git", args...)
+		cmd.Dir = cloneDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+	run("config", "user.email", "test@test.com")
+	run("config", "user.name", "Test User")
+	run("config", "commit.gpgsign", "false")
+	return cloneDir, run
+}
+
+func TestEnsureMetadataBranch_DisconnectedBranchesNotReconciledInEnable(t *testing.T) {
+	t.Parallel()
+
+	bareDir := initBareWithMetadataBranch(t)
+	cloneDir, run := cloneWithConfig(t, bareDir)
+
+	// Create a disconnected local branch with different checkpoint data
+	run("checkout", "--orphan", "temp-orphan")
+	run("rm", "-rf", ".")
+	localCheckpointDir := filepath.Join(cloneDir, "ab", "cdef012345")
+	if err := os.MkdirAll(localCheckpointDir, 0o755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(localCheckpointDir, "metadata.json"),
+		[]byte(`{"checkpoint_id":"abcdef012345"}`), 0o644,
+	); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run("add", ".")
+	run("commit", "-m", "Checkpoint: abcdef012345")
+	run("branch", "-f", paths.MetadataBranchName, "temp-orphan")
+
+	repo, err := git.PlainOpen(cloneDir)
+	if err != nil {
+		t.Fatalf("failed to open repo: %v", err)
+	}
+
+	// Get local ref hash before EnsureMetadataBranch
+	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	localRefBefore, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+
+	if err := EnsureMetadataBranch(repo); err != nil {
+		t.Fatalf("EnsureMetadataBranch() failed: %v", err)
+	}
+
+	// EnsureMetadataBranch should NOT reconcile disconnected branches.
+	// Reconciliation happens at pre-push time or via 'entire doctor'.
+	// The local branch should be unchanged.
+	localRefAfter, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+	if localRefAfter.Hash() != localRefBefore.Hash() {
+		t.Error("EnsureMetadataBranch should not modify disconnected local branch with real data")
+	}
+}
+
+func TestEnsureMetadataBranch_DoesNotFastForwardWhenBehind(t *testing.T) {
+	t.Parallel()
+
+	bareDir := initBareWithMetadataBranch(t)
+	cloneDir, run := cloneWithConfig(t, bareDir)
+
+	// Create local branch from remote (normal state)
+	repo, err := git.PlainOpen(cloneDir)
+	if err != nil {
+		t.Fatalf("failed to open repo: %v", err)
+	}
+	if err := EnsureMetadataBranch(repo); err != nil {
+		t.Fatalf("first EnsureMetadataBranch() failed: %v", err)
+	}
+
+	// Remember current local hash
+	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	localBefore, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+
+	// Add a second checkpoint to the remote (simulates another machine pushing)
+	run("checkout", paths.MetadataBranchName)
+	secondDir := filepath.Join(cloneDir, "cd", "ef01234567")
+	if err := os.MkdirAll(secondDir, 0o755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(secondDir, "metadata.json"),
+		[]byte(`{"checkpoint_id":"cdef01234567"}`), 0o644,
+	); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run("add", ".")
+	run("commit", "-m", "Checkpoint: cdef01234567")
+	run("push", "origin", paths.MetadataBranchName)
+
+	// Reset local branch back to the old commit (local is now behind remote)
+	if err := repo.Storer.SetReference(
+		plumbing.NewHashReference(refName, localBefore.Hash()),
+	); err != nil {
+		t.Fatalf("failed to reset ref: %v", err)
+	}
+
+	// Re-open to clear caches
+	repo, err = git.PlainOpen(cloneDir)
+	if err != nil {
+		t.Fatalf("failed to reopen repo: %v", err)
+	}
+
+	if err := EnsureMetadataBranch(repo); err != nil {
+		t.Fatalf("second EnsureMetadataBranch() failed: %v", err)
+	}
+
+	// EnsureMetadataBranch no longer fast-forwards diverged branches (handled by push path).
+	// Local should be unchanged since it has real data and shares ancestry with remote.
+	localAfter, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+	if localAfter.Hash() != localBefore.Hash() {
+		t.Error("EnsureMetadataBranch should not modify local branch with shared ancestry")
+	}
+}
+
+// buildCommittedTree creates a git tree with the sharded committed checkpoint layout
+// used by entire/checkpoints/v1. files is a map of path -> content relative to the tree root.
+// Example: {"a3/b2c4d5e6f7/0/prompt.txt": "Hello"} creates the nested directory structure.
+func buildCommittedTree(t *testing.T, files map[string]string) *object.Tree {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init repo: %v", err)
+	}
+
+	for path, content := range files {
+		absPath := filepath.Join(dir, path)
+		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+			t.Fatalf("failed to create directory for %s: %v", path, err)
+		}
+		if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+			t.Fatalf("failed to write %s: %v", path, err)
+		}
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	if _, err := wt.Add("."); err != nil {
+		t.Fatalf("failed to add files: %v", err)
+	}
+	commitHash, err := wt.Commit("test tree", &git.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+	})
+	if err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+
+	commit, err := repo.CommitObject(commitHash)
+	if err != nil {
+		t.Fatalf("failed to get commit: %v", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("failed to get tree: %v", err)
+	}
+	return tree
+}
+
+func TestReadLatestSessionPromptFromCommittedTree(t *testing.T) {
+	t.Parallel()
+
+	// Checkpoint ID "a3b2c4d5e6f7" -> path "a3/b2c4d5e6f7"
+	cpID := id.MustCheckpointID("a3b2c4d5e6f7")
+
+	t.Run("single session reads from 0/prompt.txt", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Implement login feature",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "Implement login feature" {
+			t.Errorf("got %q, want %q", got, "Implement login feature")
+		}
+	})
+
+	t.Run("multi session reads from latest session", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "First session prompt",
+			"a3/b2c4d5e6f7/1/prompt.txt": "Second session prompt",
+			"a3/b2c4d5e6f7/2/prompt.txt": "Third session prompt",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 3)
+		if got != "Third session prompt" {
+			t.Errorf("got %q, want %q", got, "Third session prompt")
+		}
+	})
+
+	t.Run("falls back to session 0 when computed index missing", func(t *testing.T) {
+		t.Parallel()
+		// Tree only has session 0, but sessionCount says 3
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Fallback prompt",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 3)
+		if got != "Fallback prompt" {
+			t.Errorf("got %q, want %q", got, "Fallback prompt")
+		}
+	})
+
+	t.Run("returns empty for missing prompt.txt", func(t *testing.T) {
+		t.Parallel()
+		// Session directory exists but no prompt.txt
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/metadata.json": `{"session_id":"test"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "" {
+			t.Errorf("got %q, want empty string", got)
+		}
+	})
+
+	t.Run("returns empty for missing checkpoint path", func(t *testing.T) {
+		t.Parallel()
+		// Tree has a different checkpoint ID
+		tree := buildCommittedTree(t, map[string]string{
+			"ff/aabbccddee/0/prompt.txt": "Wrong checkpoint",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "" {
+			t.Errorf("got %q, want empty string", got)
+		}
+	})
+
+	t.Run("returns empty for zero session count", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Some prompt",
+		})
+
+		// sessionCount=0 triggers latestIndex=max(0-1,0)=0, should still read session 0
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 0)
+		if got != "Some prompt" {
+			t.Errorf("got %q, want %q", got, "Some prompt")
+		}
+	})
+
+	t.Run("falls back to earlier session when latest has no prompt", func(t *testing.T) {
+		t.Parallel()
+		// Session 1 (latest) has no prompt.txt, session 0 does.
+		// This happens when a test session gets condensed alongside a real one.
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt":    "Real session prompt",
+			"a3/b2c4d5e6f7/1/metadata.json": `{"session_id":"test"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 2)
+		if got != "Real session prompt" {
+			t.Errorf("got %q, want %q", got, "Real session prompt")
+		}
+	})
+
+	t.Run("falls back through multiple empty sessions to find prompt", func(t *testing.T) {
+		t.Parallel()
+		// Sessions 2 and 1 have no prompt, session 0 does.
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt":    "Original prompt",
+			"a3/b2c4d5e6f7/1/metadata.json": `{"session_id":"s1"}`,
+			"a3/b2c4d5e6f7/2/metadata.json": `{"session_id":"s2"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 3)
+		if got != "Original prompt" {
+			t.Errorf("got %q, want %q", got, "Original prompt")
+		}
+	})
+
+	t.Run("returns empty when no session has a prompt", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/metadata.json": `{"session_id":"s0"}`,
+			"a3/b2c4d5e6f7/1/metadata.json": `{"session_id":"s1"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 2)
+		if got != "" {
+			t.Errorf("got %q, want empty string", got)
+		}
+	})
+
+	t.Run("falls back when latest has empty prompt.txt", func(t *testing.T) {
+		t.Parallel()
+		// Latest session has a prompt.txt file but it's empty — should fall back.
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Real prompt",
+			"a3/b2c4d5e6f7/1/prompt.txt": "",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 2)
+		if got != "Real prompt" {
+			t.Errorf("got %q, want %q", got, "Real prompt")
+		}
+	})
+
+	t.Run("extracts first prompt from multi-prompt content", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "First prompt\n\n---\n\nSecond prompt",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "First prompt" {
+			t.Errorf("got %q, want %q", got, "First prompt")
+		}
+	})
 }
 
 func TestIsEmptyRepository(t *testing.T) {

@@ -46,7 +46,7 @@ func TestShadow_FullWorkflow(t *testing.T) {
 	env.GitCheckoutNewBranch("feature/auth")
 
 	// Initialize Entire AFTER branch switch to avoid go-git cleaning untracked files
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	initialHead := env.GetHeadHash()
 	t.Logf("Initial HEAD on feature/auth: %s", initialHead[:7])
@@ -57,8 +57,8 @@ func TestShadow_FullWorkflow(t *testing.T) {
 	t.Log("Phase 2: Starting session and creating first checkpoint")
 
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create authentication module"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	// Verify session state file exists in .git/entire-sessions/
@@ -102,8 +102,8 @@ func TestShadow_FullWorkflow(t *testing.T) {
 	t.Log("Phase 3: Creating second checkpoint (continuing same session)")
 
 	// Continue the same session (not a new session) - this is the expected Claude behavior
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit (checkpoint 2) failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Add password hashing"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (checkpoint 2) failed: %v", err)
 	}
 
 	// Create hash.go and modify auth.go
@@ -188,8 +188,8 @@ func TestShadow_FullWorkflow(t *testing.T) {
 	t.Log("Phase 5: Creating checkpoint after rewind (continuing same session)")
 
 	// Continue the same session after rewind
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit (after rewind) failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Use bcrypt for hashing"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (after rewind) failed: %v", err)
 	}
 
 	// Reset transcript builder for next checkpoint
@@ -273,8 +273,8 @@ func TestShadow_FullWorkflow(t *testing.T) {
 
 	// Start new session
 	session4 := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session4.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit (session4) failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session4.ID, "Add session management"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (session4) failed: %v", err)
 	}
 
 	// Create session management file
@@ -381,7 +381,7 @@ func TestShadow_SessionStateLocation(t *testing.T) {
 	env.GitCheckoutNewBranch("feature/test")
 
 	// Initialize AFTER branch switch
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	session := env.NewSession()
 	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
@@ -418,7 +418,7 @@ func TestShadow_MultipleConcurrentSessions(t *testing.T) {
 	env.GitCheckoutNewBranch("feature/test")
 
 	// Initialize AFTER branch switch
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	// Start first session
 	session1 := env.NewSession()
@@ -493,7 +493,7 @@ func TestShadow_ShadowBranchMigrationOnPull(t *testing.T) {
 	env.GitCommit("Initial commit")
 
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	originalHead := env.GetHeadHash()
 	originalShadowBranch := env.GetShadowBranchNameForCommit(originalHead)
@@ -587,7 +587,7 @@ func TestShadow_ShadowBranchNaming(t *testing.T) {
 	env.GitCheckoutNewBranch("feature/test")
 
 	// Initialize AFTER branch switch
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	baseHead := env.GetHeadHash()
 
@@ -638,12 +638,12 @@ func TestShadow_TranscriptCondensation(t *testing.T) {
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	// Start session and create checkpoint with transcript
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create main.go with hello world"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	// Create a file change
@@ -673,44 +673,20 @@ func TestShadow_TranscriptCondensation(t *testing.T) {
 		t.Fatal("entire/checkpoints/v1 branch should exist after condensation")
 	}
 
-	// Verify root metadata.json (CheckpointSummary) exists
-	summaryPath := CheckpointSummaryPath(checkpointID)
-	if !env.FileExistsInBranch(paths.MetadataBranchName, summaryPath) {
-		t.Errorf("root metadata.json should exist at %s", summaryPath)
-	}
+	// Comprehensive checkpoint validation
+	env.ValidateCheckpoint(CheckpointValidation{
+		CheckpointID:    checkpointID,
+		SessionID:       session.ID,
+		Strategy:        strategy.StrategyNameManualCommit,
+		FilesTouched:    []string{"main.go"},
+		ExpectedPrompts: []string{"Create main.go with hello world"},
+		ExpectedTranscriptContent: []string{
+			"Create main.go with hello world",
+			"main.go",
+		},
+	})
 
-	// Verify transcript file exists in session subdirectory (new format: 0/full.jsonl)
-	transcriptPath := SessionFilePath(checkpointID, paths.TranscriptFileName)
-	if !env.FileExistsInBranch(paths.MetadataBranchName, transcriptPath) {
-		t.Errorf("Transcript (%s) should exist at %s", paths.TranscriptFileName, transcriptPath)
-	} else {
-		t.Log("✓ Transcript file exists in checkpoint")
-	}
-
-	// Verify content_hash.txt exists in session subdirectory
-	hashPath := SessionFilePath(checkpointID, "content_hash.txt")
-	if !env.FileExistsInBranch(paths.MetadataBranchName, hashPath) {
-		t.Errorf("content_hash.txt should exist at %s", hashPath)
-	}
-
-	// Verify root metadata.json can be read and parsed as CheckpointSummary
-	summaryContent, found := env.ReadFileFromBranch(paths.MetadataBranchName, summaryPath)
-	if !found {
-		t.Fatal("root metadata.json should be readable")
-	}
-	var summary checkpoint.CheckpointSummary
-	if err := json.Unmarshal([]byte(summaryContent), &summary); err != nil {
-		t.Fatalf("failed to parse root metadata.json as CheckpointSummary: %v", err)
-	}
-
-	// Verify Sessions array is populated
-	if len(summary.Sessions) == 0 {
-		t.Errorf("CheckpointSummary.Sessions should have at least one entry")
-	} else {
-		t.Logf("✓ CheckpointSummary has %d session(s)", len(summary.Sessions))
-	}
-
-	// Verify agent field is in session-level metadata (not root summary)
+	// Additionally verify agent field in session metadata
 	sessionMetadataPath := SessionFilePath(checkpointID, paths.MetadataFileName)
 	sessionMetadataContent, found := env.ReadFileFromBranch(paths.MetadataBranchName, sessionMetadataPath)
 	if !found {
@@ -729,11 +705,11 @@ func TestShadow_TranscriptCondensation(t *testing.T) {
 }
 
 // TestShadow_FullTranscriptContext verifies that each checkpoint includes
-// the full session transcript, preserving complete history across commits.
+// only the prompts from its checkpoint portion, not the entire session.
 //
-// This tests transcript preservation:
-// - First commit: context.md includes prompts 1-2
-// - Second commit: context.md includes prompts 1-3 (full transcript preserved)
+// This tests checkpoint-scoped prompts:
+// - First commit: prompt.txt includes prompts 1-2 (from checkpoint start)
+// - Second commit: prompt.txt includes only prompt 3 (from second checkpoint start)
 func TestShadow_FullTranscriptContext(t *testing.T) {
 	t.Parallel()
 	env := NewTestEnv(t)
@@ -745,14 +721,14 @@ func TestShadow_FullTranscriptContext(t *testing.T) {
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/incremental")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	t.Log("Phase 1: First session with two prompts")
 
 	// Start first session
 	session1 := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session1.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session1.ID, "Create function A in a.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	// First prompt: create file A
@@ -767,6 +743,9 @@ func TestShadow_FullTranscriptContext(t *testing.T) {
 	session1.TranscriptBuilder.AddAssistantMessage("Done creating function A!")
 
 	// Second prompt in same session: create file B
+	if err := env.SimulateUserPromptSubmitWithPrompt(session1.ID, "Now create function B in b.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (second prompt) failed: %v", err)
+	}
 	fileBContent := "package main\n\nfunc B() {}\n"
 	env.WriteFile("b.go", fileBContent)
 
@@ -781,7 +760,7 @@ func TestShadow_FullTranscriptContext(t *testing.T) {
 		t.Fatalf("Failed to write transcript: %v", err)
 	}
 
-	// Save checkpoint (triggers SaveChanges)
+	// Save checkpoint (triggers SaveStep)
 	if err := env.SimulateStop(session1.ID, session1.TranscriptPath); err != nil {
 		t.Fatalf("SimulateStop failed: %v", err)
 	}
@@ -812,20 +791,12 @@ func TestShadow_FullTranscriptContext(t *testing.T) {
 		}
 	}
 
-	contextPath1 := SessionFilePath(checkpoint1ID, "context.md")
-	context1Content, found := env.ReadFileFromBranch(paths.MetadataBranchName, contextPath1)
-	if !found {
-		t.Errorf("context.md should exist at %s", contextPath1)
-	} else {
-		t.Logf("First context.md content:\n%s", context1Content)
-	}
-
 	t.Log("Phase 3: Continue session with third prompt")
 
 	// Continue the session with a new prompt
 	// First, simulate another user prompt submit to track the new base
-	if err := env.SimulateUserPromptSubmit(session1.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit (continued) failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session1.ID, "Finally, create function C in c.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (continued) failed: %v", err)
 	}
 
 	// Third prompt: create file C
@@ -875,28 +846,9 @@ func TestShadow_FullTranscriptContext(t *testing.T) {
 	} else {
 		t.Logf("Second prompt.txt content:\n%s", prompt2Content)
 
-		// Should contain all prompts (full transcript preserved)
+		// Should contain only the checkpoint-scoped prompt (third prompt only)
 		if !strings.Contains(prompt2Content, "create function C") {
 			t.Error("Second prompt.txt should contain 'create function C'")
-		}
-		if !strings.Contains(prompt2Content, "Create function A") {
-			t.Error("Second prompt.txt should contain 'Create function A' (full transcript)")
-		}
-		if !strings.Contains(prompt2Content, "create function B") {
-			t.Error("Second prompt.txt should contain 'create function B' (full transcript)")
-		}
-	}
-
-	contextPath2 := SessionFilePath(checkpoint2ID, "context.md")
-	context2Content, found := env.ReadFileFromBranch(paths.MetadataBranchName, contextPath2)
-	if !found {
-		t.Errorf("context.md should exist at %s", contextPath2)
-	} else {
-		t.Logf("Second context.md content:\n%s", context2Content)
-
-		// Should contain full transcript context
-		if !strings.Contains(context2Content, "Create function A") {
-			t.Error("Second context.md should contain 'Create function A' (full transcript)")
 		}
 	}
 
@@ -923,13 +875,13 @@ func TestShadow_RewindAndCondensation(t *testing.T) {
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/rewind-test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	t.Log("Phase 1: Create first checkpoint with prompt 1")
 
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function A in a.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	// First prompt: create file A
@@ -1035,20 +987,6 @@ func TestShadow_RewindAndCondensation(t *testing.T) {
 		}
 	}
 
-	// Check context.md
-	contextPath := SessionFilePath(checkpointID, "context.md")
-	contextContent, found := env.ReadFileFromBranch(paths.MetadataBranchName, contextPath)
-	if !found {
-		t.Errorf("context.md should exist at %s", contextPath)
-	} else {
-		t.Logf("context.md content:\n%s", contextContent)
-
-		// Should NOT contain context from checkpoint 2
-		if strings.Contains(contextContent, "modify function A") {
-			t.Error("context.md should NOT contain 'modify function A' - we rewound past that checkpoint")
-		}
-	}
-
 	t.Log("Shadow rewind and condensation test completed successfully!")
 }
 
@@ -1073,13 +1011,13 @@ func TestShadow_RewindPreservesUntrackedFilesFromSessionStart(t *testing.T) {
 	env.WriteFile(".claude/settings.json", untrackedContent)
 
 	// Initialize Entire with manual-commit strategy
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	t.Log("Phase 1: Create first checkpoint")
 
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function A"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	// First prompt: create file A
@@ -1196,13 +1134,13 @@ func TestShadow_IntermediateCommitsWithoutPrompts(t *testing.T) {
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/intermediate-commits")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	t.Log("Phase 1: Start session and create checkpoint")
 
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function A in a.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	// First prompt: create file A
@@ -1255,8 +1193,8 @@ func TestShadow_IntermediateCommitsWithoutPrompts(t *testing.T) {
 	t.Log("Phase 4: New Claude work and commit")
 
 	// Now user enters new prompt and does more work
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function B in b.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	fileBContent := "package main\n\nfunc B() {}\n"
@@ -1306,13 +1244,13 @@ func TestShadow_IntermediateCommitsWithoutPrompts(t *testing.T) {
 	t.Log("Intermediate commits test completed successfully!")
 }
 
-// TestShadow_FullTranscriptCondensationWithIntermediateCommits tests that full transcripts
-// are preserved across multiple commits.
+// TestShadow_FullTranscriptCondensationWithIntermediateCommits tests that checkpoints
+// contain only checkpoint-scoped prompts across multiple commits.
 //
 // Scenario:
-// 1. Session with prompts A and B, commit 1
+// 1. Session with prompts A and B, commit 1 → prompt.txt has A and B
 // 2. Continue session with prompt C, commit 2 (without intermediate prompt submit)
-// 3. Verify commit 2's checkpoint has full transcript (A, B, and C)
+// 3. Verify commit 2's prompt.txt has only C (checkpoint-scoped)
 func TestShadow_FullTranscriptCondensationWithIntermediateCommits(t *testing.T) {
 	t.Parallel()
 	env := NewTestEnv(t)
@@ -1324,13 +1262,13 @@ func TestShadow_FullTranscriptCondensationWithIntermediateCommits(t *testing.T) 
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/incremental-intermediate")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	t.Log("Phase 1: Session with two prompts")
 
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function A"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	// First prompt
@@ -1343,6 +1281,9 @@ func TestShadow_FullTranscriptCondensationWithIntermediateCommits(t *testing.T) 
 	session.TranscriptBuilder.AddToolResult(toolID1)
 
 	// Second prompt in same session
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function B"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (second prompt) failed: %v", err)
+	}
 	fileBContent := "package main\n\nfunc B() {}\n"
 	env.WriteFile("b.go", fileBContent)
 
@@ -1376,10 +1317,13 @@ func TestShadow_FullTranscriptCondensationWithIntermediateCommits(t *testing.T) 
 	}
 	t.Logf("First checkpoint prompts:\n%s", prompt1Content)
 
-	t.Log("Phase 3: Continue session with third prompt (no SimulateUserPromptSubmit)")
+	t.Log("Phase 3: Continue session with third prompt")
 
-	// Continue working WITHOUT calling SimulateUserPromptSubmit
-	// This simulates the case where HEAD moved but InitializeSession wasn't called
+	// Submit the new prompt through the hook so it gets recorded in prompt.txt
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function C"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (third prompt) failed: %v", err)
+	}
+
 	fileCContent := "package main\n\nfunc C() {}\n"
 	env.WriteFile("c.go", fileCContent)
 
@@ -1397,7 +1341,7 @@ func TestShadow_FullTranscriptCondensationWithIntermediateCommits(t *testing.T) 
 		t.Fatalf("SimulateStop (second) failed: %v", err)
 	}
 
-	t.Log("Phase 4: Second commit (without intermediate prompt submit)")
+	t.Log("Phase 4: Second commit")
 
 	env.GitCommitWithShadowHooks("Add function C", "c.go")
 	commit2Hash := env.GetHeadHash()
@@ -1408,7 +1352,7 @@ func TestShadow_FullTranscriptCondensationWithIntermediateCommits(t *testing.T) 
 		t.Errorf("Commits should have different checkpoint IDs")
 	}
 
-	t.Log("Phase 5: Verify second checkpoint has full transcript (A, B, and C)")
+	t.Log("Phase 5: Verify second checkpoint has only checkpoint-scoped prompt (C)")
 
 	// Session files are now in numbered subdirectory (e.g., 0/prompt.txt)
 	prompt2Content, found := env.ReadFileFromBranch(paths.MetadataBranchName, SessionFilePath(checkpoint2ID, "prompt.txt"))
@@ -1418,18 +1362,18 @@ func TestShadow_FullTranscriptCondensationWithIntermediateCommits(t *testing.T) 
 
 	t.Logf("Second checkpoint prompts:\n%s", prompt2Content)
 
-	// Should contain all prompts (full transcript preserved)
+	// Should contain only the checkpoint-scoped prompt (C), not earlier prompts
 	if !strings.Contains(prompt2Content, "function C") {
 		t.Error("Second checkpoint should contain 'function C'")
 	}
-	if !strings.Contains(prompt2Content, "function A") {
-		t.Error("Second checkpoint should contain 'function A' (full transcript)")
+	if strings.Contains(prompt2Content, "function A") {
+		t.Error("Second checkpoint should NOT contain 'function A' (checkpoint-scoped)")
 	}
-	if !strings.Contains(prompt2Content, "function B") {
-		t.Error("Second checkpoint should contain 'function B' (full transcript)")
+	if strings.Contains(prompt2Content, "function B") {
+		t.Error("Second checkpoint should NOT contain 'function B' (checkpoint-scoped)")
 	}
 
-	t.Log("Full transcript condensation with intermediate commits test completed successfully!")
+	t.Log("Checkpoint-scoped prompt condensation with intermediate commits test completed successfully!")
 }
 
 // TestShadow_RewindPreservesUntrackedFilesWithExistingShadowBranch tests that untracked files
@@ -1446,7 +1390,7 @@ func TestShadow_RewindPreservesUntrackedFilesWithExistingShadowBranch(t *testing
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/existing-shadow-test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	t.Log("Phase 1: Create untracked file before session starts")
 
@@ -1459,8 +1403,8 @@ func TestShadow_RewindPreservesUntrackedFilesWithExistingShadowBranch(t *testing
 
 	// First session - creates the shadow branch
 	session1 := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session1.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session1.ID, "Create old.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	env.WriteFile("old.go", "package main\n")
@@ -1488,8 +1432,8 @@ func TestShadow_RewindPreservesUntrackedFilesWithExistingShadowBranch(t *testing
 
 	// Continue the SAME session (Claude resumes with the same session ID)
 	// This is the expected behavior - continuing work on the same base commit
-	if err := env.SimulateUserPromptSubmit(session1.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit (continue session) failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session1.ID, "Create A"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (continue session) failed: %v", err)
 	}
 
 	// Reset transcript builder for next checkpoint
@@ -1521,8 +1465,8 @@ func TestShadow_RewindPreservesUntrackedFilesWithExistingShadowBranch(t *testing
 	t.Log("Phase 3: Create third checkpoint")
 
 	// Continue the session for the third checkpoint
-	if err := env.SimulateUserPromptSubmit(session1.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit (checkpoint 3) failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session1.ID, "Create B"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt (checkpoint 3) failed: %v", err)
 	}
 
 	// Reset transcript builder for next checkpoint
@@ -1586,13 +1530,13 @@ func TestShadow_TrailerRemovalSkipsCondensation(t *testing.T) {
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/trailer-opt-out")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	t.Log("Phase 1: Create session with content")
 
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function A"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	fileAContent := "package main\n\nfunc A() {}\n"
@@ -1642,8 +1586,8 @@ func TestShadow_TrailerRemovalSkipsCondensation(t *testing.T) {
 	t.Log("Phase 4: Now commit WITH trailer (user keeps it)")
 
 	// Continue session with new content
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create function B"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	fileBContent := "package main\n\nfunc B() {}\n"
@@ -1705,12 +1649,12 @@ func TestShadow_SessionsBranchCommitTrailers(t *testing.T) {
 	env.GitAdd("README.md")
 	env.GitCommit("Initial commit")
 	env.GitCheckoutNewBranch("feature/trailer-test")
-	env.InitEntire(strategy.StrategyNameManualCommit)
+	env.InitEntire()
 
 	// Start session and create checkpoint
 	session := env.NewSession()
-	if err := env.SimulateUserPromptSubmit(session.ID); err != nil {
-		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	if err := env.SimulateUserPromptSubmitWithPrompt(session.ID, "Create main.go"); err != nil {
+		t.Fatalf("SimulateUserPromptSubmitWithPrompt failed: %v", err)
 	}
 
 	fileContent := "package main\n\nfunc main() {}\n"

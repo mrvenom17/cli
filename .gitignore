@@ -16,6 +16,7 @@
 coverage.*
 *.coverprofile
 profile.cov
+*.prof
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -35,14 +36,20 @@ go.work.sum
 
 # Binary output (only in root)
 /entire
+/vogon
+/testreport
 
 # Build output directory
 /dist/
-completions
+/completions/
 
+
+# E2E test artifacts
+e2e/artifacts/
 
 # worktrees
 .worktrees/
+.claude/worktrees/
 test-gemini.txt
 entire-main
 entire-test
@@ -50,3 +57,5 @@ test_claude.txt
 cmd/entire/entire
 docs/requirements
 docs/plans
+docs/reviews
+tmp/

@@ -6,11 +6,17 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
+
+	"github.com/zricethezav/gitleaks/v8/detect"
 )
 
 // secretPattern matches high-entropy strings that may be secrets.
-var secretPattern = regexp.MustCompile(`[A-Za-z0-9/+_=-]{10,}`)
+// Note: / is excluded to prevent matching entire file paths as single tokens.
+// Base64 and JWT tokens are still caught via high-entropy segments between slashes.
+var secretPattern = regexp.MustCompile(`[A-Za-z0-9+_=-]{10,}`)
 
 // entropyThreshold is the minimum Shannon entropy for a string to be considered
 // a secret. 4.5 was chosen through trial and error: high enough to avoid false
@@ -18,23 +24,105 @@ var secretPattern = regexp.MustCompile(`[A-Za-z0-9/+_=-]{10,}`)
 // and tokens which tend to have entropy well above 5.0.
 const entropyThreshold = 4.5
 
-// String replaces high-entropy strings matching secretPattern with REDACTED.
+// RedactedPlaceholder is the replacement text used for redacted secrets.
+const RedactedPlaceholder = "REDACTED"
+
+var (
+	gitleaksDetector     *detect.Detector
+	gitleaksDetectorOnce sync.Once
+)
+
+func getDetector() *detect.Detector {
+	gitleaksDetectorOnce.Do(func() {
+		d, err := detect.NewDetectorDefaultConfig()
+		if err != nil {
+			return
+		}
+		gitleaksDetector = d
+	})
+	return gitleaksDetector
+}
+
+// region represents a byte range to redact.
+type region struct{ start, end int }
+
+// String replaces secrets in s with "REDACTED" using layered detection:
+// 1. Entropy-based: high-entropy alphanumeric sequences (threshold 4.5)
+// 2. Pattern-based: gitleaks regex rules (180+ known secret formats)
+// A string is redacted if EITHER method flags it.
 func String(s string) string {
-	locs := secretPattern.FindAllStringIndex(s, -1)
-	if len(locs) == 0 {
+	var regions []region
+
+	// 1. Entropy-based detection.
+	for _, loc := range secretPattern.FindAllStringIndex(s, -1) {
+		start, end := loc[0], loc[1]
+
+		// Don't consume characters that are part of JSON/string escape sequences.
+		// Example: in "controller.go\nmodel.go", the regex could match "nmodel"
+		// (consuming the 'n' from '\n'), and after replacement the '\' would be
+		// followed by 'R' from "REDACTED", creating invalid escape '\R'.
+		// Only skip for known JSON escape letters to avoid trimming real secrets
+		// that happen to follow a literal backslash in decoded content.
+		if start > 0 && s[start-1] == '\\' {
+			switch s[start] {
+			case 'n', 't', 'r', 'b', 'f', 'u', '"', '\\', '/':
+				start++
+				if end-start < 10 {
+					continue
+				}
+			}
+		}
+
+		if shannonEntropy(s[start:end]) > entropyThreshold {
+			regions = append(regions, region{start, end})
+		}
+	}
+
+	// 2. Pattern-based detection via gitleaks.
+	if d := getDetector(); d != nil {
+		for _, f := range d.DetectString(s) {
+			if f.Secret == "" {
+				continue
+			}
+			searchFrom := 0
+			for {
+				idx := strings.Index(s[searchFrom:], f.Secret)
+				if idx < 0 {
+					break
+				}
+				absIdx := searchFrom + idx
+				regions = append(regions, region{absIdx, absIdx + len(f.Secret)})
+				searchFrom = absIdx + len(f.Secret)
+			}
+		}
+	}
+
+	if len(regions) == 0 {
 		return s
 	}
+
+	// Merge overlapping regions and build result.
+	sort.Slice(regions, func(i, j int) bool {
+		return regions[i].start < regions[j].start
+	})
+	merged := []region{regions[0]}
+	for _, r := range regions[1:] {
+		last := &merged[len(merged)-1]
+		if r.start <= last.end {
+			if r.end > last.end {
+				last.end = r.end
+			}
+		} else {
+			merged = append(merged, r)
+		}
+	}
+
 	var b strings.Builder
 	prev := 0
-	for _, loc := range locs {
-		b.WriteString(s[prev:loc[0]])
-		match := s[loc[0]:loc[1]]
-		if isSecret(match) {
-			b.WriteString("REDACTED")
-		} else {
-			b.WriteString(match)
-		}
-		prev = loc[1]
+	for _, r := range merged {
+		b.WriteString(s[prev:r.start])
+		b.WriteString(RedactedPlaceholder)
+		prev = r.end
 	}
 	b.WriteString(s[prev:])
 	return b.String()
@@ -140,24 +228,32 @@ func collectJSONLReplacements(v any) [][2]string {
 }
 
 // shouldSkipJSONLField returns true if a JSON key should be excluded from scanning/redaction.
-// Skips "signature" (exact) and any key ending in "id" (case-insensitive).
+// Skips "signature" (exact), ID fields (ending in "id"/"ids"), and common path/directory fields.
 func shouldSkipJSONLField(key string) bool {
 	if key == "signature" {
 		return true
 	}
 	lower := strings.ToLower(key)
-	return strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "ids")
+
+	// Skip ID fields
+	if strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "ids") {
+		return true
+	}
+
+	// Skip common path and directory fields from agent transcripts.
+	// These appear frequently in tool calls and are structural, not secrets.
+	switch lower {
+	case "filepath", "file_path", "cwd", "root", "directory", "dir", "path":
+		return true
+	}
+
+	return false
 }
 
 // shouldSkipJSONLObject returns true if the object has "type":"image" or "type":"image_url".
 func shouldSkipJSONLObject(obj map[string]any) bool {
 	t, ok := obj["type"].(string)
 	return ok && (strings.HasPrefix(t, "image") || t == "base64")
-}
-
-// isSecret returns true if match is a high-entropy string that looks like a secret.
-func isSecret(match string) bool {
-	return shannonEntropy(match) > entropyThreshold
 }
 
 func shannonEntropy(s string) float64 {

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Entire CLI creates checkpoints for AI coding sessions. The system is agent-agnostic - it works with Claude Code, Cursor, Copilot, or any tool that triggers Entire hooks.
+Entire CLI creates checkpoints for AI coding sessions. The system is agent-agnostic - it works with Claude Code, Gemini CLI, OpenCode, Cursor, Copilot CLI, or any tool that triggers Entire hooks.
 
 ## Domain Model
 
@@ -145,13 +145,6 @@ func (s *ManualCommitStrategy) CondenseSession(
 ) (*CondenseResult, error)
 ```
 
-**Auto-commit** writes committed checkpoints directly:
-
-```go
-// SaveChanges creates a commit on the active branch and writes metadata.
-func (s *AutoCommitStrategy) SaveChanges(ctx SaveContext) error
-```
-
 ## Storage
 
 | Type | Location | Contents |
@@ -176,8 +169,7 @@ Contains full worktree snapshot plus metadata overlay. **Multiple concurrent ses
 <worktree files...>
 .entire/metadata/<session-id-1>/
 ├── full.jsonl           # Session 1 transcript
-├── prompt.txt           # User prompts
-├── context.md           # Generated context
+├── prompt.txt           # Checkpoint-scoped user prompts
 └── tasks/<tool-use-id>/ # Task checkpoints
 .entire/metadata/<session-id-2>/
 ├── full.jsonl           # Session 2 transcript (concurrent)
@@ -204,8 +196,7 @@ Metadata only, sharded by checkpoint ID. Supports **multiple sessions per checkp
 ├── 0/                   # First session (0-based indexing)
 │   ├── metadata.json    # Session-specific CommittedMetadata
 │   ├── full.jsonl
-│   ├── prompt.txt
-│   ├── context.md
+│   ├── prompt.txt       # Checkpoint-scoped user prompts
 │   └── content_hash.txt
 ├── 1/                   # Second session
 │   ├── metadata.json
@@ -226,7 +217,6 @@ Metadata only, sharded by checkpoint ID. Supports **multiple sessions per checkp
     {
       "metadata": "/ab/c123def456/0/metadata.json",
       "transcript": "/ab/c123def456/0/full.jsonl",
-      "context": "/ab/c123def456/0/context.md",
       "content_hash": "/ab/c123def456/0/content_hash.txt",
       "prompt": "/ab/c123def456/0/prompt.txt"
     }
@@ -255,15 +245,13 @@ The checkpoint ID is the **stable identifier** that links user commits to metada
 **Format:** 12-hex-character random ID (e.g., `a3b2c4d5e6f7`)
 
 **Generation:**
-- Manual-commit: Generated during condensation (post-commit hook)
-- Auto-commit: Generated when creating the commit
+- Generated during condensation (post-commit hook)
 
 **Usage:**
 
-1. **User commit trailer** (both strategies):
+1. **User commit trailer**:
    - `Entire-Checkpoint: a3b2c4d5e6f7` added to user's commit message
-   - Auto-commit: Added programmatically
-   - Manual-commit: Added by `prepare-commit-msg` hook (user can remove)
+   - Added by `prepare-commit-msg` hook (user can remove)
 
 2. **Directory sharding** on `entire/checkpoints/v1`:
    - Path: `<id[:2]>/<id[2:]>/` (e.g., `a3/b2c4d5e6f7/`)
@@ -279,14 +267,15 @@ The checkpoint ID is the **stable identifier** that links user commits to metada
 ```
 User commit → Metadata:
   1. Extract "Entire-Checkpoint: a3b2c4d5e6f7" from commit message
-  2. Look up metadata:
-     - Approach A: Read entire/checkpoints/v1 tree at a3/b2c4d5e6f7/
-     - Approach B: Search git log entire/checkpoints/v1 for "Checkpoint: a3b2c4d5e6f7"
+  2. Read entire/checkpoints/v1 tree at a3/b2c4d5e6f7/
 
 Metadata → User commits:
   Given checkpoint ID a3b2c4d5e6f7
   → Search branch history for commits with "Entire-Checkpoint: a3b2c4d5e6f7"
 ```
+
+Note: Commit subjects on `entire/checkpoints/v1` (e.g., `Checkpoint: a3b2c4d5e6f7`)
+are for human readability in `git log` only. The CLI always reads from the tree at HEAD.
 
 **Example Flow:**
 
@@ -315,8 +304,7 @@ Metadata → User commits:
 │     │   (checkpoint_id: "a3b2c4d5e6f7")          │
 │     ├── 0/                                       │
 │     │   ├── full.jsonl                           │
-│     │   ├── prompt.txt                           │
-│     │   └── context.md                           │
+│     │   └── prompt.txt                           │
 │     └── ...                                      │
 │                                                   │
 │   Trailers:                                      │
@@ -352,10 +340,11 @@ Strategies use `checkpoint.Store` primitives - storage details are encapsulated.
 
 Strategies determine checkpoint timing and type:
 
-| Strategy | On Save | On Task Complete | On User Commit |
-|----------|---------|------------------|----------------|
-| Manual-commit | Temporary | Temporary | Condense → Committed |
-| Auto-commit | Committed | Committed | — |
+| Event | Checkpoint Type |
+|-------|----------------|
+| On Save | Temporary |
+| On Task Complete | Temporary |
+| On User Commit | Condense → Committed |
 
 ## Rewind
 
@@ -392,4 +381,3 @@ If user does stash → pull → apply (HEAD changes without commit):
 | Current | Legacy |
 |---------|--------|
 | Manual-commit | Shadow |
-| Auto-commit | Dual |

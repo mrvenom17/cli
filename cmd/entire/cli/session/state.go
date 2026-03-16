@@ -4,21 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/validation"
 )
 
 const (
 	// SessionStateDirName is the directory name for session state files within git common dir.
 	SessionStateDirName = "entire-sessions"
+
+	// StaleSessionThreshold is the duration after which an ended session is considered stale
+	// and will be automatically deleted during load/list operations.
+	StaleSessionThreshold = 7 * 24 * time.Hour
 )
 
 // State represents the state of an active session.
@@ -59,11 +67,25 @@ type State struct {
 	// Empty means idle (backward compat with pre-state-machine files).
 	Phase Phase `json:"phase,omitempty"`
 
-	// PendingCheckpointID is the checkpoint ID for the current commit cycle.
-	// Generated once when first needed, reused across all commits in the session.
-	PendingCheckpointID string `json:"pending_checkpoint_id,omitempty"`
+	// TurnID is a unique identifier for the current agent turn.
+	// Lifecycle:
+	//   - Generated fresh in InitializeSession at each turn start
+	//   - Shared across all checkpoints within the same turn
+	//   - Used to correlate related checkpoints when a turn's work spans multiple commits
+	//   - Persists until the next InitializeSession call generates a new one
+	TurnID string `json:"turn_id,omitempty"`
 
-	// LastInteractionTime is updated on every hook invocation.
+	// TurnCheckpointIDs tracks all checkpoint IDs condensed during the current turn.
+	// Lifecycle:
+	//   - Set in PostCommit when a checkpoint is condensed for an ACTIVE session
+	//   - Consumed in HandleTurnEnd to finalize all checkpoints with the full transcript
+	//   - Cleared in HandleTurnEnd after finalization completes
+	//   - Cleared in InitializeSession when a new prompt starts
+	//   - Cleared when session is reset (ResetSession deletes the state file entirely)
+	TurnCheckpointIDs []string `json:"turn_checkpoint_ids,omitempty"`
+
+	// LastInteractionTime is updated on agent-interaction events (TurnStart,
+	// TurnEnd, SessionStop, Compaction) but NOT on git commit hooks.
 	// Used for stale session detection in "entire doctor".
 	LastInteractionTime *time.Time `json:"last_interaction_time,omitempty"`
 
@@ -88,14 +110,33 @@ type State struct {
 	// FilesTouched tracks files modified/created/deleted during this session
 	FilesTouched []string `json:"files_touched,omitempty"`
 
-	// LastCheckpointID is the checkpoint ID from last condensation, reused for subsequent commits without new content
+	// LastCheckpointID is the checkpoint ID from the most recent condensation.
+	// Used to restore the Entire-Checkpoint trailer on amend and to identify
+	// sessions that have been condensed at least once. Cleared on new prompt.
 	LastCheckpointID id.CheckpointID `json:"last_checkpoint_id,omitempty"`
 
+	// FullyCondensed indicates this session has been condensed and has no remaining
+	// carry-forward files. PostCommit skips fully-condensed sessions entirely.
+	// Set after successful condensation when no files remain for carry-forward
+	// and the session phase is ENDED. Cleared on session reactivation (ENDED →
+	// ACTIVE via TurnStart, or ENDED → IDLE via SessionStart) by ActionClearEndedAt.
+	FullyCondensed bool `json:"fully_condensed,omitempty"`
+
 	// AgentType identifies the agent that created this session (e.g., "Claude Code", "Gemini CLI", "Cursor")
-	AgentType agent.AgentType `json:"agent_type,omitempty"`
+	AgentType types.AgentType `json:"agent_type,omitempty"`
+
+	// ModelName is the LLM model used in this session (e.g., "claude-sonnet-4-20250514", "gpt-4o").
+	// Set from hook data when the agent provides it.
+	ModelName string `json:"model_name,omitempty"`
 
 	// Token usage tracking (accumulated across all checkpoints in this session)
 	TokenUsage *agent.TokenUsage `json:"token_usage,omitempty"`
+
+	// Hook-provided session metrics (for agents like Cursor that report via hooks)
+	SessionDurationMs int64 `json:"session_duration_ms,omitempty"`
+	SessionTurnCount  int   `json:"session_turn_count,omitempty"`
+	ContextTokens     int   `json:"context_tokens,omitempty"`
+	ContextWindowSize int   `json:"context_window_size,omitempty"`
 
 	// Deprecated: TranscriptLinesAtStart is replaced by CheckpointTranscriptStart.
 	// Kept for backward compatibility with existing state files.
@@ -108,15 +149,17 @@ type State struct {
 	// TranscriptPath is the path to the live transcript file (for mid-session commit detection)
 	TranscriptPath string `json:"transcript_path,omitempty"`
 
-	// FirstPrompt is the first user prompt that started this session (truncated for display)
-	FirstPrompt string `json:"first_prompt,omitempty"`
+	// LastPrompt is the most recent user prompt for this session (truncated for display).
+	// Updated on every turn start (UserPromptSubmit). JSON tag kept as "first_prompt"
+	// for backward compatibility with existing state files.
+	LastPrompt string `json:"last_prompt,omitempty"`
 
 	// PromptAttributions tracks user and agent line changes at each prompt start.
 	// This enables accurate attribution by capturing user edits between checkpoints.
 	PromptAttributions []PromptAttribution `json:"prompt_attributions,omitempty"`
 
 	// PendingPromptAttribution holds attribution calculated at prompt start (before agent runs).
-	// This is moved to PromptAttributions when SaveChanges is called.
+	// This is moved to PromptAttributions when SaveStep is called.
 	PendingPromptAttribution *PromptAttribution `json:"pending_prompt_attribution,omitempty"`
 }
 
@@ -149,7 +192,20 @@ type PromptAttribution struct {
 
 // NormalizeAfterLoad applies backward-compatible migrations to state loaded from disk.
 // Call this after deserializing a State from JSON.
-func (s *State) NormalizeAfterLoad() {
+func (s *State) NormalizeAfterLoad(ctx context.Context) {
+	// Normalize legacy phase values. "active_committed" was removed with the
+	// 1:1 checkpoint model in favor of the state machine handling commits
+	// during ACTIVE phase with immediate condensation.
+	if s.Phase == "active_committed" {
+		logCtx := logging.WithComponent(ctx, "session")
+		logging.Info(logCtx, "migrating legacy active_committed phase to active",
+			slog.String("session_id", s.SessionID),
+		)
+		s.Phase = PhaseActive
+	}
+	// Also normalize via PhaseFromString to handle any other legacy/unknown values.
+	s.Phase = PhaseFromString(string(s.Phase))
+
 	// Migrate transcript fields: CheckpointTranscriptStart replaces both
 	// CondensedTranscriptLines and TranscriptLinesAtStart from older state files.
 	if s.CheckpointTranscriptStart == 0 {
@@ -175,6 +231,19 @@ func (s *State) NormalizeAfterLoad() {
 	}
 }
 
+// IsStale returns true when a session hasn't seen interaction for longer than
+// StaleSessionThreshold. Falls back to StartedAt when LastInteractionTime is
+// nil (sessions created before interaction tracking was added).
+func (s *State) IsStale() bool {
+	var since time.Duration
+	if s.LastInteractionTime != nil {
+		since = time.Since(*s.LastInteractionTime)
+	} else {
+		since = time.Since(s.StartedAt)
+	}
+	return since > StaleSessionThreshold
+}
+
 // StateStore provides low-level operations for managing session state files.
 //
 // StateStore is a primitive for session state persistence. It is NOT the same as
@@ -190,8 +259,8 @@ type StateStore struct {
 
 // NewStateStore creates a new state store.
 // Uses the git common dir to store session state (shared across worktrees).
-func NewStateStore() (*StateStore, error) {
-	commonDir, err := getGitCommonDir()
+func NewStateStore(ctx context.Context) (*StateStore, error) {
+	commonDir, err := getGitCommonDir(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get git common dir: %w", err)
 	}
@@ -207,10 +276,9 @@ func NewStateStoreWithDir(stateDir string) *StateStore {
 }
 
 // Load loads the session state for the given session ID.
-// Returns (nil, nil) when session file doesn't exist (not an error condition).
+// Returns (nil, nil) when session file doesn't exist or session is stale (not an error condition).
+// Stale sessions (ended longer than StaleSessionThreshold ago) are automatically deleted.
 func (s *StateStore) Load(ctx context.Context, sessionID string) (*State, error) {
-	_ = ctx // Reserved for future use
-
 	// Validate session ID to prevent path traversal
 	if err := validation.ValidateSessionID(sessionID); err != nil {
 		return nil, fmt.Errorf("invalid session ID: %w", err)
@@ -230,7 +298,17 @@ func (s *StateStore) Load(ctx context.Context, sessionID string) (*State, error)
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal session state: %w", err)
 	}
-	state.NormalizeAfterLoad()
+	state.NormalizeAfterLoad(ctx)
+
+	if state.IsStale() {
+		logCtx := logging.WithComponent(ctx, "session")
+		logging.Debug(logCtx, "deleting stale session state",
+			slog.String("session_id", sessionID),
+		)
+		_ = s.Clear(ctx, sessionID) //nolint:errcheck // best-effort cleanup of stale session
+		return nil, nil             //nolint:nilnil // stale session treated as not found
+	}
+
 	return &state, nil
 }
 
@@ -274,14 +352,12 @@ func (s *StateStore) Clear(ctx context.Context, sessionID string) error {
 		return fmt.Errorf("invalid session ID: %w", err)
 	}
 
-	stateFile := s.stateFilePath(sessionID)
-
-	if err := os.Remove(stateFile); err != nil {
-		if os.IsNotExist(err) {
-			return nil // Already gone, not an error
-		}
-		return fmt.Errorf("failed to remove session state file: %w", err)
+	// Remove all files for this session (state .json, .model hint, any future hint files).
+	matches, _ := filepath.Glob(filepath.Join(s.stateDir, sessionID+".*")) //nolint:errcheck // pattern is always valid
+	for _, f := range matches {
+		_ = os.Remove(f)
 	}
+
 	return nil
 }
 
@@ -296,8 +372,6 @@ func (s *StateStore) RemoveAll() error {
 
 // List returns all session states.
 func (s *StateStore) List(ctx context.Context) ([]*State, error) {
-	_ = ctx // Reserved for future use
-
 	entries, err := os.ReadDir(s.stateDir)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -321,7 +395,7 @@ func (s *StateStore) List(ctx context.Context) ([]*State, error) {
 			continue // Skip corrupted state files
 		}
 		if state == nil {
-			continue
+			continue // Not found or stale (Load handles cleanup)
 		}
 
 		states = append(states, state)
@@ -334,11 +408,43 @@ func (s *StateStore) stateFilePath(sessionID string) string {
 	return filepath.Join(s.stateDir, sessionID+".json")
 }
 
+// gitCommonDirCache caches the git common dir to avoid repeated subprocess calls.
+// Keyed by working directory to handle directory changes (same pattern as paths.WorktreeRoot).
+var (
+	gitCommonDirMu       sync.RWMutex
+	gitCommonDirCache    string
+	gitCommonDirCacheDir string
+)
+
+// ClearGitCommonDirCache clears the cached git common dir.
+// Useful for testing when changing directories.
+func ClearGitCommonDirCache() {
+	gitCommonDirMu.Lock()
+	gitCommonDirCache = ""
+	gitCommonDirCacheDir = ""
+	gitCommonDirMu.Unlock()
+}
+
 // getGitCommonDir returns the path to the shared git directory.
 // In a regular checkout, this is .git/
 // In a worktree, this is the main repo's .git/ (not .git/worktrees/<name>/)
-func getGitCommonDir() (string, error) {
-	ctx := context.Background()
+// The result is cached per working directory.
+func getGitCommonDir(ctx context.Context) (string, error) {
+	cwd, err := os.Getwd() //nolint:forbidigo // used for cache key, not git-relative paths
+	if err != nil {
+		cwd = ""
+	}
+
+	// Check cache with read lock first
+	gitCommonDirMu.RLock()
+	if gitCommonDirCache != "" && gitCommonDirCacheDir == cwd {
+		cached := gitCommonDirCache
+		gitCommonDirMu.RUnlock()
+		return cached, nil
+	}
+	gitCommonDirMu.RUnlock()
+
+	// Cache miss — resolve via git subprocess
 	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-common-dir")
 	cmd.Dir = "."
 	output, err := cmd.Output()
@@ -353,6 +459,12 @@ func getGitCommonDir() (string, error) {
 	if !filepath.IsAbs(commonDir) {
 		commonDir = filepath.Join(".", commonDir)
 	}
+	commonDir = filepath.Clean(commonDir)
 
-	return filepath.Clean(commonDir), nil
+	gitCommonDirMu.Lock()
+	gitCommonDirCache = commonDir
+	gitCommonDirCacheDir = cwd
+	gitCommonDirMu.Unlock()
+
+	return commonDir, nil
 }

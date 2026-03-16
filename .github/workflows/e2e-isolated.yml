@@ -1,0 +1,75 @@
+name: E2E Isolated Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: "Agent to test"
+        required: true
+        default: "gemini-cli"
+        type: choice
+        options: [claude-code, opencode, gemini-cli, cursor-cli, factoryai-droid, copilot-cli]
+      test:
+        description: "Test name filter (regex)"
+        required: true
+        default: "TestInteractiveMultiStep"
+
+jobs:
+  e2e-isolated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build entire CLI
+        run: go build -o /usr/local/bin/entire ./cmd/entire
+
+      - name: Install agent CLI
+        run: |
+          case "${{ inputs.agent }}" in
+            claude-code) curl -fsSL https://claude.ai/install.sh | bash ;;
+            opencode)    curl -fsSL https://opencode.ai/install | bash ;;
+            gemini-cli)  npm install -g @google/gemini-cli ;;
+            cursor-cli)  curl https://cursor.com/install -fsS | bash ;;
+            factoryai-droid) curl -fsSL https://app.factory.ai/cli | sh ;;
+            copilot-cli)  npm install -g @github/copilot  ;;
+          esac
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Bootstrap agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: go run ./e2e/bootstrap
+
+      - name: Run isolated test
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          E2E_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts
+          E2E_ENTIRE_BIN: /usr/local/bin/entire
+        run: |
+          mkdir -p "$E2E_ARTIFACT_DIR"
+          mise run test:e2e --agent ${{ inputs.agent }} "${{ inputs.test }}"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-isolated-${{ inputs.agent }}-${{ inputs.test }}
+          path: e2e-artifacts/
+          retention-days: 7

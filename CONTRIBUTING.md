@@ -8,6 +8,21 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
 
 ---
 
+## Before You Code: Discuss First
+
+The fastest way to get a contribution merged is to align with maintainers before writing code. Please **open an issue first** using our [issue templates](https://github.com/entireio/cli/issues/new/choose) and wait for maintainer feedback before starting implementation.
+
+### Contribution Workflow
+
+1. **Open an issue** describing the problem or feature
+2. **Wait for maintainer feedback** -- we may have relevant context or plans
+3. **Get approval** before starting implementation
+4. **Submit your PR** referencing the approved issue
+5. **Address all feedback** including automated Copilot comments
+6. **Maintainer review and merge**
+
+---
+
 ## First-Time Contributors
 
 New to the project? Welcome! Here's how to get started:
@@ -39,9 +54,9 @@ If you discover a security vulnerability, **do not report it through GitHub Issu
 
 Contributions and communications are expected to occur through:
 
-- GitHub (issues, pull requests, discussions)
-- Official Entire Slack channels
-- Community events and public representation (e.g., conferences, meetups)
+- [GitHub Issues](https://github.com/entireio/cli/issues) - Bug reports and feature requests
+- [GitHub Discussions](https://github.com/entireio/cli/discussions) - Questions and general conversation
+- [Discord](https://discord.gg/jZJs3Tue4S) - Real-time chat and support
 
 Please represent the project and community respectfully in all public and private interactions.
 
@@ -78,14 +93,13 @@ Please answer these questions in your bug report:
 4. **Can you reproduce it?** - Does it happen every time or intermittently?
 5. **Any additional context?** - Logs, screenshots, or related issues
 
-
 ---
 
 ## Local Setup
 
 ### Prerequisites
 
-- **Go 1.25.x** - Check with `go version`
+- **Go 1.26.x** - Check with `go version`
 - **mise** - Task runner and version manager. Install with `curl https://mise.run | sh`
 
 ### Clone and Install
@@ -205,7 +219,7 @@ These are markdown files that define specialized behaviors for Claude Code (e.g.
 
 ### 2. Coding Agent Integrations (Go)
 
-These are Go implementations that integrate Entire with different AI coding tools (Claude, Cursor, Aider, etc.) using the Agent abstraction layer.
+These are Go implementations that integrate Entire with different AI coding tools (Claude Code, Gemini CLI, OpenCode, Cursor, Copilot CLI, etc.) using the Agent abstraction layer.
 
 - **Location:** `cmd/entire/cli/agent/`
 - **Steps:**
@@ -226,13 +240,55 @@ These are Go implementations that integrate Entire with different AI coding tool
 
 ## Submitting a Pull Request
 
+### Before You Submit
+
+- **Related issue exists and is approved** -- Your PR references an issue where a maintainer has acknowledged the approach. (Exceptions: documentation fixes, typo corrections, and `good-first-issue` items.)
+- **Linting passes** -- Run `mise run lint` (includes golangci-lint, gofmt, gomod, shellcheck)
+- **Tests pass** -- Run `mise run test` to verify your changes
+- **Tests included** -- New Go code and functionality should have accompanying tests
+- **Entire checkpoint trailers included** -- See [Using Entire While Contributing](#using-entire-while-contributing) below
+
+PRs that skip these steps are likely to be closed without merge.
+
+### Submitting
+
 1. **Push** your branch to your fork
 2. **Open a PR** against the `main` branch
-3. **Fill out** the PR template with:
-   - Clear description of changes
-   - Related issue numbers
-   - Testing done
-4. **Wait for review** - maintainers will provide feedback
+3. **Describe your changes** -- Link the related issue, summarize what changed and what testing you did
+4. **Address Copilot feedback** -- See [Responding to Automated Review](#responding-to-automated-review)
+5. **Wait for maintainer review**
+
+---
+
+## Responding to Automated Review
+
+Co-pilot agent reviews every PR and provides feedback on code quality, potential bugs, and project conventions.
+
+**Read and respond to every Copilot comment.** PRs with unaddressed Copilot feedback will not move to maintainer review.
+
+- **Fixed** -- Push a commit addressing the issue.
+- **Disagree** -- Reply explaining your reasoning. The Copilot isn't always right.
+- **Question** -- Ask for clarification. We're happy to help.
+
+Addressing Copilot feedback upfront is the fastest path to maintainer review.
+
+---
+
+## Using Entire While Contributing
+
+We use Entire on Entire. When contributing, install the Entire CLI and let it capture your coding sessions -- this gives us valuable dogfooding data and helps improve the tool.
+
+### Setup
+
+Install the latest version of the Entire CLI (see [installation docs](https://docs.entire.io/cli/installation)) and verify with `entire version`. Entire is already configured in this repository, so there's no need to run `entire enable`.
+
+### Checkpoint Trailers
+
+All commits should include `Entire-Checkpoint` trailers from your sessions. These are added automatically by the `prepare-commit-msg` hook when Entire is enabled. The trailers link your commits to session metadata on the `entire/checkpoints/v1` branch.
+
+### Sessions Branch
+
+When you push your PR branch, Entire can automatically push the `entire/checkpoints/v1` branch alongside it (if `push_sessions` is enabled in your settings). Include this in your PR so maintainers can review the session context behind your changes.
 
 ---
 
@@ -273,7 +329,7 @@ Join the Entire community:
 - **Discord** - [Join our server][discord] for discussions and support
 - **GitHub Discussions** - [Join the conversation][discussions]
 
-[discord]: https://discord.gg/4WXDu2Ph
+[discord]: https://discord.gg/jZJs3Tue4S
 [discussions]: https://github.com/entireio/cli/discussions
 
 ---
@@ -281,7 +337,8 @@ Join the Entire community:
 ## Additional Resources
 
 - [README](README.md) - Setup and usage documentation
-- [CLAUDE.md](CLAUDE.md) - Architecture and development reference
+- [CLAUDE.md](CLAUDE.md) - Architecture and development reference (Claude Code)
+- [AGENTS.md](AGENTS.md) - Architecture and development reference (Gemini CLI, OpenCode, Cursor, Copilot CLI)
 - [Code of Conduct](CODE_OF_CONDUCT.md) - Community guidelines
 - [Security Policy](SECURITY.md) - Reporting security vulnerabilities
 

@@ -2,7 +2,9 @@ package versioncheck
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,6 +39,7 @@ func TestIsOutdated(t *testing.T) {
 		// Pre-release versions (semver uses hyphen)
 		{"1.0.0-rc1", "1.0.0", true, "prerelease in current"},
 		{"1.0.0", "1.0.1-rc1", true, "prerelease in latest is still newer"},
+		{"1.0.0-dev-xxx", "1.0.1", false, "dev build skips version check"},
 	}
 
 	for _, tt := range tests {
@@ -156,12 +159,12 @@ func TestFetchLatestVersion(t *testing.T) {
 	githubAPIURL = server.URL
 	t.Cleanup(func() { githubAPIURL = original })
 
-	version, err := fetchLatestVersion()
+	version, err := fetchLatestVersion(context.Background())
 	if err != nil {
-		t.Fatalf("fetchLatestVersion() error = %v", err)
+		t.Fatalf("fetchLatestVersion(context.Background()) error = %v", err)
 	}
 	if version != "v1.2.3" {
-		t.Errorf("fetchLatestVersion() = %q, want v1.2.3", version)
+		t.Errorf("fetchLatestVersion(context.Background()) = %q, want v1.2.3", version)
 	}
 }
 
@@ -181,9 +184,9 @@ func TestFetchLatestVersionPrerelease(t *testing.T) {
 	githubAPIURL = server.URL
 	t.Cleanup(func() { githubAPIURL = original })
 
-	_, err := fetchLatestVersion()
+	_, err := fetchLatestVersion(context.Background())
 	if err == nil {
-		t.Fatal("fetchLatestVersion() expected error for prerelease, got nil")
+		t.Fatal("fetchLatestVersion(context.Background()) expected error for prerelease, got nil")
 	}
 }
 
@@ -197,9 +200,9 @@ func TestFetchLatestVersionServerError(t *testing.T) {
 	githubAPIURL = server.URL
 	t.Cleanup(func() { githubAPIURL = original })
 
-	_, err := fetchLatestVersion()
+	_, err := fetchLatestVersion(context.Background())
 	if err == nil {
-		t.Fatal("fetchLatestVersion() expected error for 500 response, got nil")
+		t.Fatal("fetchLatestVersion(context.Background()) expected error for 500 response, got nil")
 	}
 }
 
@@ -231,16 +234,63 @@ func TestParseGitHubRelease(t *testing.T) {
 }
 
 func TestUpdateCommand(t *testing.T) {
-	// updateCommand should return one of the two valid update commands
-	cmd := updateCommand()
-
-	validCommands := map[string]bool{
-		"brew upgrade entire":                            true,
-		"curl -fsSL https://entire.io/install.sh | bash": true,
+	tests := []struct {
+		name     string
+		execPath func() (string, error)
+		want     string
+	}{
+		{
+			name:     "homebrew cellar path",
+			execPath: func() (string, error) { return "/opt/homebrew/Cellar/entire/1.0.0/bin/entire", nil },
+			want:     "brew upgrade entire",
+		},
+		{
+			name:     "homebrew opt path",
+			execPath: func() (string, error) { return "/opt/homebrew/bin/entire", nil },
+			want:     "brew upgrade entire",
+		},
+		{
+			name:     "linuxbrew path",
+			execPath: func() (string, error) { return "/home/linuxbrew/.linuxbrew/bin/entire", nil },
+			want:     "brew upgrade entire",
+		},
+		{
+			name:     "mise path",
+			execPath: func() (string, error) { return "/home/user/.local/share/mise/installs/entire/1.0.0/bin/entire", nil },
+			want:     "mise upgrade entire",
+		},
+		{
+			name:     "username mise not detected as mise install",
+			execPath: func() (string, error) { return "/home/mise/bin/entire", nil },
+			want:     "curl -fsSL https://entire.io/install.sh | bash",
+		},
+		{
+			name:     "username homebrew not detected as brew install",
+			execPath: func() (string, error) { return "/home/homebrew/bin/entire", nil },
+			want:     "curl -fsSL https://entire.io/install.sh | bash",
+		},
+		{
+			name:     "unknown path falls back to curl",
+			execPath: func() (string, error) { return "/usr/local/bin/entire", nil },
+			want:     "curl -fsSL https://entire.io/install.sh | bash",
+		},
+		{
+			name:     "executable error falls back to curl",
+			execPath: func() (string, error) { return "", errors.New("not found") },
+			want:     "curl -fsSL https://entire.io/install.sh | bash",
+		},
 	}
 
-	if !validCommands[cmd] {
-		t.Errorf("updateCommand() = %q, want one of %v", cmd, validCommands)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := executablePath
+			executablePath = tt.execPath
+			t.Cleanup(func() { executablePath = original })
+
+			if got := updateCommand(); got != tt.want {
+				t.Errorf("updateCommand() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -280,7 +330,7 @@ func TestCheckAndNotify_SkipsDevVersion(t *testing.T) {
 	server := newVersionServer(t, "v9.9.9")
 	cmd, buf := setupCheckAndNotifyTest(t, server.URL)
 
-	CheckAndNotify(cmd.OutOrStdout(), "dev")
+	CheckAndNotify(context.Background(), cmd.OutOrStdout(), "dev")
 
 	if buf.Len() != 0 {
 		t.Errorf("expected no output for dev version, got %q", buf.String())
@@ -291,7 +341,7 @@ func TestCheckAndNotify_SkipsEmptyVersion(t *testing.T) {
 	server := newVersionServer(t, "v9.9.9")
 	cmd, buf := setupCheckAndNotifyTest(t, server.URL)
 
-	CheckAndNotify(cmd.OutOrStdout(), "")
+	CheckAndNotify(context.Background(), cmd.OutOrStdout(), "")
 
 	if buf.Len() != 0 {
 		t.Errorf("expected no output for empty version, got %q", buf.String())
@@ -315,7 +365,7 @@ func TestCheckAndNotify_SkipsWhenCacheIsFresh(t *testing.T) {
 		t.Fatalf("saveCache() error = %v", err)
 	}
 
-	CheckAndNotify(cmd.OutOrStdout(), "1.0.0")
+	CheckAndNotify(context.Background(), cmd.OutOrStdout(), "1.0.0")
 
 	if buf.Len() != 0 {
 		t.Errorf("expected no output when cache is fresh, got %q", buf.String())
@@ -326,7 +376,7 @@ func TestCheckAndNotify_PrintsNotificationWhenOutdated(t *testing.T) {
 	server := newVersionServer(t, "v2.0.0")
 	cmd, buf := setupCheckAndNotifyTest(t, server.URL)
 
-	CheckAndNotify(cmd.OutOrStdout(), "1.0.0")
+	CheckAndNotify(context.Background(), cmd.OutOrStdout(), "1.0.0")
 
 	output := buf.String()
 	if !strings.Contains(output, "v2.0.0") {
@@ -341,7 +391,7 @@ func TestCheckAndNotify_NoNotificationWhenUpToDate(t *testing.T) {
 	server := newVersionServer(t, "v1.0.0")
 	cmd, buf := setupCheckAndNotifyTest(t, server.URL)
 
-	CheckAndNotify(cmd.OutOrStdout(), "1.0.0")
+	CheckAndNotify(context.Background(), cmd.OutOrStdout(), "1.0.0")
 
 	if buf.Len() != 0 {
 		t.Errorf("expected no output when up to date, got %q", buf.String())
@@ -356,7 +406,7 @@ func TestCheckAndNotify_FetchFailureUpdatesCacheToPreventRetry(t *testing.T) {
 
 	cmd, buf := setupCheckAndNotifyTest(t, server.URL)
 
-	CheckAndNotify(cmd.OutOrStdout(), "1.0.0")
+	CheckAndNotify(context.Background(), cmd.OutOrStdout(), "1.0.0")
 
 	// No notification on fetch failure
 	if buf.Len() != 0 {

@@ -183,51 +183,87 @@ func TestExtractModifiedFiles_ReplaceTool(t *testing.T) {
 	}
 }
 
-func TestExtractLastUserPrompt(t *testing.T) {
+func TestParseTranscript_ArrayContent(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name string
-		data string
-		want string
-	}{
-		{
-			name: "string content",
-			data: `{"messages": [
-				{"type": "user", "content": "first"},
-				{"type": "gemini", "content": "response"},
-				{"type": "user", "content": "second"}
-			]}`,
-			want: "second",
-		},
-		{
-			name: "only one user message",
-			data: `{"messages": [{"type": "user", "content": "only message"}]}`,
-			want: "only message",
-		},
-		{
-			name: "no user messages",
-			data: `{"messages": [{"type": "gemini", "content": "assistant only"}]}`,
-			want: "",
-		},
-		{
-			name: "empty messages",
-			data: `{"messages": []}`,
-			want: "",
-		},
+	// Real Gemini CLI format: user messages have array content, gemini messages have string content
+	data := []byte(`{
+  "messages": [
+    {"type": "user", "content": [{"text": "hello world"}]},
+    {"type": "gemini", "content": "hi there"},
+    {"type": "user", "content": [{"text": "do something"}]},
+    {"type": "gemini", "content": "sure thing"}
+  ]
+}`)
+
+	transcript, err := ParseTranscript(data)
+	if err != nil {
+		t.Fatalf("ParseTranscript() error = %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := ExtractLastUserPrompt([]byte(tt.data))
-			if err != nil {
-				t.Fatalf("ExtractLastUserPrompt() error = %v", err)
-			}
-			if got != tt.want {
-				t.Errorf("ExtractLastUserPrompt() = %q, want %q", got, tt.want)
-			}
-		})
+	if len(transcript.Messages) != 4 {
+		t.Fatalf("ParseTranscript() got %d messages, want 4", len(transcript.Messages))
+	}
+
+	// User messages should have extracted text from array
+	if transcript.Messages[0].Content != "hello world" {
+		t.Errorf("Message 0 content = %q, want %q", transcript.Messages[0].Content, "hello world")
+	}
+	if transcript.Messages[2].Content != "do something" {
+		t.Errorf("Message 2 content = %q, want %q", transcript.Messages[2].Content, "do something")
+	}
+
+	// Gemini messages should have string content as-is
+	if transcript.Messages[1].Content != "hi there" {
+		t.Errorf("Message 1 content = %q, want %q", transcript.Messages[1].Content, "hi there")
+	}
+	if transcript.Messages[3].Content != "sure thing" {
+		t.Errorf("Message 3 content = %q, want %q", transcript.Messages[3].Content, "sure thing")
+	}
+}
+
+func TestParseTranscript_ArrayContentMultipleParts(t *testing.T) {
+	t.Parallel()
+
+	// Array content with multiple text parts should be joined with newlines
+	data := []byte(`{
+  "messages": [
+    {"type": "user", "content": [{"text": "part one"}, {"text": "part two"}]}
+  ]
+}`)
+
+	transcript, err := ParseTranscript(data)
+	if err != nil {
+		t.Fatalf("ParseTranscript() error = %v", err)
+	}
+
+	if len(transcript.Messages) != 1 {
+		t.Fatalf("ParseTranscript() got %d messages, want 1", len(transcript.Messages))
+	}
+
+	want := "part one\npart two"
+	if transcript.Messages[0].Content != want {
+		t.Errorf("Content = %q, want %q", transcript.Messages[0].Content, want)
+	}
+}
+
+func TestParseTranscript_NullContent(t *testing.T) {
+	t.Parallel()
+
+	data := []byte(`{
+  "messages": [
+    {"type": "user", "content": null},
+    {"type": "gemini", "content": "response"}
+  ]
+}`)
+
+	transcript, err := ParseTranscript(data)
+	if err != nil {
+		t.Fatalf("ParseTranscript() error = %v", err)
+	}
+
+	if transcript.Messages[0].Content != "" {
+		t.Errorf("Content = %q, want empty string", transcript.Messages[0].Content)
 	}
 }
 
@@ -417,6 +453,59 @@ func TestGetLastMessageIDFromFile(t *testing.T) {
 	})
 }
 
+func TestExtractAllUserPrompts_ArrayContent(t *testing.T) {
+	t.Parallel()
+
+	// Real Gemini format with array content for user messages
+	data := []byte(`{
+  "messages": [
+    {"type": "user", "content": [{"text": "first prompt"}]},
+    {"type": "gemini", "content": "response 1"},
+    {"type": "user", "content": [{"text": "second prompt"}]},
+    {"type": "gemini", "content": "response 2"}
+  ]
+}`)
+
+	prompts, err := ExtractAllUserPrompts(data)
+	if err != nil {
+		t.Fatalf("ExtractAllUserPrompts() error = %v", err)
+	}
+
+	if len(prompts) != 2 {
+		t.Fatalf("ExtractAllUserPrompts() got %d prompts, want 2", len(prompts))
+	}
+
+	if prompts[0] != "first prompt" {
+		t.Errorf("prompts[0] = %q, want %q", prompts[0], "first prompt")
+	}
+	if prompts[1] != "second prompt" {
+		t.Errorf("prompts[1] = %q, want %q", prompts[1], "second prompt")
+	}
+}
+
+func TestExtractModifiedFiles_ArrayContent(t *testing.T) {
+	t.Parallel()
+
+	// Real Gemini transcript format: user messages have array content
+	data := []byte(`{
+  "messages": [
+    {"type": "user", "content": [{"text": "create a file"}]},
+    {"type": "gemini", "content": "", "toolCalls": [{"name": "write_file", "args": {"file_path": "foo.go"}}]},
+    {"type": "user", "content": [{"text": "edit the file"}]},
+    {"type": "gemini", "content": "", "toolCalls": [{"name": "edit_file", "args": {"file_path": "bar.go"}}]}
+  ]
+}`)
+
+	files, err := ExtractModifiedFiles(data)
+	if err != nil {
+		t.Fatalf("ExtractModifiedFiles() error = %v", err)
+	}
+
+	if len(files) != 2 {
+		t.Errorf("ExtractModifiedFiles() got %d files, want 2", len(files))
+	}
+}
+
 func TestExtractModifiedFilesFromTranscript(t *testing.T) {
 	t.Parallel()
 
@@ -439,24 +528,6 @@ func TestExtractModifiedFilesFromTranscript(t *testing.T) {
 	}
 }
 
-func TestExtractLastUserPromptFromTranscript(t *testing.T) {
-	t.Parallel()
-
-	transcript := &GeminiTranscript{
-		Messages: []GeminiMessage{
-			{Type: "user", Content: "first prompt"},
-			{Type: "gemini", Content: "response"},
-			{Type: "user", Content: "last prompt"},
-		},
-	}
-
-	got := ExtractLastUserPromptFromTranscript(transcript)
-
-	if got != "last prompt" {
-		t.Errorf("got %q, want 'last prompt'", got)
-	}
-}
-
 func TestCalculateTokenUsage_BasicMessages(t *testing.T) {
 	t.Parallel()
 
@@ -470,7 +541,11 @@ func TestCalculateTokenUsage_BasicMessages(t *testing.T) {
   ]
 }`)
 
-	usage := CalculateTokenUsage(data, 0)
+	ag := &GeminiCLIAgent{}
+	usage, err := ag.CalculateTokenUsage(data, 0)
+	if err != nil {
+		t.Fatalf("CalculateTokenUsage error: %v", err)
+	}
 
 	// Should have 2 API calls (2 gemini messages)
 	if usage.APICallCount != 2 {
@@ -507,7 +582,11 @@ func TestCalculateTokenUsage_StartIndex(t *testing.T) {
 }`)
 
 	// Start from index 2 - should only count the last gemini message
-	usage := CalculateTokenUsage(data, 2)
+	ag := &GeminiCLIAgent{}
+	usage, err := ag.CalculateTokenUsage(data, 2)
+	if err != nil {
+		t.Fatalf("CalculateTokenUsage error: %v", err)
+	}
 
 	// Should have 1 API call (only the gemini message at index 3)
 	if usage.APICallCount != 1 {
@@ -539,7 +618,11 @@ func TestCalculateTokenUsage_IgnoresUserMessages(t *testing.T) {
   ]
 }`)
 
-	usage := CalculateTokenUsage(data, 0)
+	ag := &GeminiCLIAgent{}
+	usage, err := ag.CalculateTokenUsage(data, 0)
+	if err != nil {
+		t.Fatalf("CalculateTokenUsage error: %v", err)
+	}
 
 	// Should only count gemini message tokens
 	if usage.APICallCount != 1 {
@@ -559,7 +642,11 @@ func TestCalculateTokenUsage_EmptyTranscript(t *testing.T) {
 	t.Parallel()
 
 	data := []byte(`{"messages": []}`)
-	usage := CalculateTokenUsage(data, 0)
+	ag := &GeminiCLIAgent{}
+	usage, err := ag.CalculateTokenUsage(data, 0)
+	if err != nil {
+		t.Fatalf("CalculateTokenUsage error: %v", err)
+	}
 
 	if usage.APICallCount != 0 {
 		t.Errorf("APICallCount = %d, want 0", usage.APICallCount)
@@ -579,7 +666,11 @@ func TestCalculateTokenUsage_InvalidJSON(t *testing.T) {
 	t.Parallel()
 
 	data := []byte(`not valid json`)
-	usage := CalculateTokenUsage(data, 0)
+	ag := &GeminiCLIAgent{}
+	usage, err := ag.CalculateTokenUsage(data, 0)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
 
 	// Should return empty usage on parse error
 	if usage.APICallCount != 0 {
@@ -598,7 +689,11 @@ func TestCalculateTokenUsage_MissingTokensField(t *testing.T) {
   ]
 }`)
 
-	usage := CalculateTokenUsage(data, 0)
+	ag := &GeminiCLIAgent{}
+	usage, err := ag.CalculateTokenUsage(data, 0)
+	if err != nil {
+		t.Fatalf("CalculateTokenUsage error: %v", err)
+	}
 
 	// No tokens to count
 	if usage.APICallCount != 0 {

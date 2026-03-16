@@ -1,10 +1,13 @@
 package geminicli
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/entireio/cli/cmd/entire/cli/agent/testutil"
 )
 
 func TestInstallHooks_FreshInstall(t *testing.T) {
@@ -12,7 +15,7 @@ func TestInstallHooks_FreshInstall(t *testing.T) {
 	t.Chdir(tempDir)
 
 	agent := &GeminiCLIAgent{}
-	count, err := agent.InstallHooks(false, false)
+	count, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -87,7 +90,7 @@ func TestInstallHooks_LocalDev(t *testing.T) {
 	t.Chdir(tempDir)
 
 	agent := &GeminiCLIAgent{}
-	_, err := agent.InstallHooks(true, false)
+	_, err := agent.InstallHooks(context.Background(), true, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -114,7 +117,7 @@ func TestInstallHooks_Idempotent(t *testing.T) {
 	agent := &GeminiCLIAgent{}
 
 	// First install
-	count1, err := agent.InstallHooks(false, false)
+	count1, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("first InstallHooks() error = %v", err)
 	}
@@ -123,7 +126,7 @@ func TestInstallHooks_Idempotent(t *testing.T) {
 	}
 
 	// Second install should add 0 hooks
-	count2, err := agent.InstallHooks(false, false)
+	count2, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("second InstallHooks() error = %v", err)
 	}
@@ -148,13 +151,13 @@ func TestInstallHooks_Force(t *testing.T) {
 	agent := &GeminiCLIAgent{}
 
 	// First install
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("first InstallHooks() error = %v", err)
 	}
 
 	// Force reinstall should replace hooks
-	count, err := agent.InstallHooks(false, true)
+	count, err := agent.InstallHooks(context.Background(), false, true)
 	if err != nil {
 		t.Fatalf("force InstallHooks() error = %v", err)
 	}
@@ -180,7 +183,7 @@ func TestInstallHooks_PreservesUserHooks(t *testing.T) {
 }`)
 
 	agent := &GeminiCLIAgent{}
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -208,6 +211,123 @@ func TestInstallHooks_PreservesUserHooks(t *testing.T) {
 	}
 }
 
+func TestInstallHooks_PreservesUnknownHookTypes(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	// Create settings with hook types we don't handle (hypothetical future Gemini hook types)
+	writeGeminiSettings(t, tempDir, `{
+  "hooks": {
+    "FutureHook": [
+      {
+        "matcher": "",
+        "hooks": [{"name": "future-hook", "type": "command", "command": "echo future"}]
+      }
+    ],
+    "AnotherNewHook": [
+      {
+        "matcher": "pattern",
+        "hooks": [{"name": "another-hook", "type": "command", "command": "echo another"}]
+      }
+    ]
+  }
+}`)
+
+	agent := &GeminiCLIAgent{}
+	_, err := agent.InstallHooks(context.Background(), false, false)
+	if err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+
+	// Read raw hooks to verify unknown hook types are preserved
+	rawHooks := testutil.ReadRawHooks(t, tempDir, ".gemini")
+
+	// Verify FutureHook is preserved
+	if _, ok := rawHooks["FutureHook"]; !ok {
+		t.Errorf("FutureHook type was not preserved, got keys: %v", testutil.GetKeys(rawHooks))
+	}
+
+	// Verify AnotherNewHook is preserved
+	if _, ok := rawHooks["AnotherNewHook"]; !ok {
+		t.Errorf("AnotherNewHook type was not preserved, got keys: %v", testutil.GetKeys(rawHooks))
+	}
+
+	// Verify the FutureHook content is intact
+	var futureMatchers []GeminiHookMatcher
+	if err := json.Unmarshal(rawHooks["FutureHook"], &futureMatchers); err != nil {
+		t.Fatalf("failed to parse FutureHook: %v", err)
+	}
+	if len(futureMatchers) != 1 {
+		t.Errorf("FutureHook matchers = %d, want 1", len(futureMatchers))
+	}
+	if len(futureMatchers) > 0 && len(futureMatchers[0].Hooks) > 0 {
+		if futureMatchers[0].Hooks[0].Command != "echo future" {
+			t.Errorf("FutureHook command = %q, want %q",
+				futureMatchers[0].Hooks[0].Command, "echo future")
+		}
+	}
+
+	// Verify AnotherNewHook content including matcher
+	var anotherMatchers []GeminiHookMatcher
+	if err := json.Unmarshal(rawHooks["AnotherNewHook"], &anotherMatchers); err != nil {
+		t.Fatalf("failed to parse AnotherNewHook: %v", err)
+	}
+	if len(anotherMatchers) > 0 {
+		if anotherMatchers[0].Matcher != "pattern" {
+			t.Errorf("AnotherNewHook matcher = %q, want %q", anotherMatchers[0].Matcher, "pattern")
+		}
+	}
+
+	// Verify our hooks were also installed
+	if _, ok := rawHooks["SessionStart"]; !ok {
+		t.Errorf("SessionStart hook should have been installed")
+	}
+}
+
+func TestUninstallHooks_PreservesUnknownHookTypes(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	// Create settings with Entire hooks AND unknown hook types
+	writeGeminiSettings(t, tempDir, `{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{"name": "entire-session-start", "type": "command", "command": "entire hooks gemini session-start"}]
+      }
+    ],
+    "FutureHook": [
+      {
+        "matcher": "",
+        "hooks": [{"name": "future-hook", "type": "command", "command": "echo future"}]
+      }
+    ]
+  }
+}`)
+
+	agent := &GeminiCLIAgent{}
+	err := agent.UninstallHooks(context.Background())
+	if err != nil {
+		t.Fatalf("UninstallHooks() error = %v", err)
+	}
+
+	// Read raw hooks to verify unknown hook types are preserved
+	rawHooks := testutil.ReadRawHooks(t, tempDir, ".gemini")
+
+	// Verify FutureHook is preserved
+	if _, ok := rawHooks["FutureHook"]; !ok {
+		t.Errorf("FutureHook type was not preserved, got keys: %v", testutil.GetKeys(rawHooks))
+	}
+
+	// Verify our hooks were removed (SessionStart should be empty/removed)
+	if sessionStartRaw, ok := rawHooks["SessionStart"]; ok {
+		var matchers []GeminiHookMatcher
+		if err := json.Unmarshal(sessionStartRaw, &matchers); err == nil && len(matchers) > 0 {
+			t.Errorf("SessionStart hook should have been removed")
+		}
+	}
+}
+
 func TestInstallHooks_PreservesUnknownFields(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Chdir(tempDir)
@@ -219,7 +339,7 @@ func TestInstallHooks_PreservesUnknownFields(t *testing.T) {
 }`)
 
 	agent := &GeminiCLIAgent{}
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -251,24 +371,24 @@ func TestUninstallHooks(t *testing.T) {
 	agent := &GeminiCLIAgent{}
 
 	// First install
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
 
 	// Verify hooks are installed
-	if !agent.AreHooksInstalled() {
+	if !agent.AreHooksInstalled(context.Background()) {
 		t.Error("hooks should be installed before uninstall")
 	}
 
 	// Uninstall
-	err = agent.UninstallHooks()
+	err = agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() error = %v", err)
 	}
 
 	// Verify hooks are removed
-	if agent.AreHooksInstalled() {
+	if agent.AreHooksInstalled(context.Background()) {
 		t.Error("hooks should not be installed after uninstall")
 	}
 }
@@ -280,7 +400,7 @@ func TestUninstallHooks_NoSettingsFile(t *testing.T) {
 	agent := &GeminiCLIAgent{}
 
 	// Should not error when no settings file exists
-	err := agent.UninstallHooks()
+	err := agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() should not error when no settings file: %v", err)
 	}
@@ -306,7 +426,7 @@ func TestUninstallHooks_PreservesUserHooks(t *testing.T) {
 }`)
 
 	agent := &GeminiCLIAgent{}
-	err := agent.UninstallHooks()
+	err := agent.UninstallHooks(context.Background())
 	if err != nil {
 		t.Fatalf("UninstallHooks() error = %v", err)
 	}
@@ -331,25 +451,25 @@ func TestAreHooksInstalled(t *testing.T) {
 	agent := &GeminiCLIAgent{}
 
 	// Should be false when no settings file
-	if agent.AreHooksInstalled() {
+	if agent.AreHooksInstalled(context.Background()) {
 		t.Error("AreHooksInstalled() should be false when no settings file")
 	}
 
 	// Install hooks
-	_, err := agent.InstallHooks(false, false)
+	_, err := agent.InstallHooks(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
 
 	// Should be true after installation
-	if !agent.AreHooksInstalled() {
+	if !agent.AreHooksInstalled(context.Background()) {
 		t.Error("AreHooksInstalled() should be true after installation")
 	}
 }
 
-func TestGetHookNames(t *testing.T) {
+func TestHookNames(t *testing.T) {
 	agent := &GeminiCLIAgent{}
-	names := agent.GetHookNames()
+	names := agent.HookNames()
 
 	expected := []string{
 		HookNameSessionStart,
@@ -366,12 +486,12 @@ func TestGetHookNames(t *testing.T) {
 	}
 
 	if len(names) != len(expected) {
-		t.Errorf("GetHookNames() returned %d names, want %d", len(names), len(expected))
+		t.Errorf("HookNames() returned %d names, want %d", len(names), len(expected))
 	}
 
 	for i, name := range expected {
 		if names[i] != name {
-			t.Errorf("GetHookNames()[%d] = %q, want %q", i, names[i], name)
+			t.Errorf("HookNames()[%d] = %q, want %q", i, names[i], name)
 		}
 	}
 }

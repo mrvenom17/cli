@@ -1,11 +1,16 @@
 package strategy
 
 import (
+	"context"
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/go-git/go-git/v5"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/session"
+	"github.com/go-git/go-git/v6"
 )
 
 // TestLoadSessionState_PackageLevel tests the package-level LoadSessionState function.
@@ -28,13 +33,13 @@ func TestLoadSessionState_PackageLevel(t *testing.T) {
 	}
 
 	// Save using package-level function
-	err = SaveSessionState(state)
+	err = SaveSessionState(context.Background(), state)
 	if err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
 	// Load using package-level function
-	loaded, err := LoadSessionState("test-session-pkg-123")
+	loaded, err := LoadSessionState(context.Background(), "test-session-pkg-123")
 	if err != nil {
 		t.Fatalf("LoadSessionState() error = %v", err)
 	}
@@ -83,12 +88,12 @@ func TestLoadSessionState_WithEndedAt(t *testing.T) {
 		StepCount:  5,
 	}
 
-	err = SaveSessionState(state)
+	err = SaveSessionState(context.Background(), state)
 	if err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
-	loaded, err := LoadSessionState("test-session-ended")
+	loaded, err := LoadSessionState(context.Background(), "test-session-ended")
 	if err != nil {
 		t.Fatalf("LoadSessionState() error = %v", err)
 	}
@@ -113,12 +118,12 @@ func TestLoadSessionState_WithEndedAt(t *testing.T) {
 		StepCount:  1,
 	}
 
-	err = SaveSessionState(stateActive)
+	err = SaveSessionState(context.Background(), stateActive)
 	if err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
-	loadedActive, err := LoadSessionState("test-session-active")
+	loadedActive, err := LoadSessionState(context.Background(), "test-session-active")
 	if err != nil {
 		t.Fatalf("LoadSessionState() error = %v", err)
 	}
@@ -152,12 +157,12 @@ func TestLoadSessionState_WithLastInteractionTime(t *testing.T) {
 		StepCount:           3,
 	}
 
-	err = SaveSessionState(state)
+	err = SaveSessionState(context.Background(), state)
 	if err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
-	loaded, err := LoadSessionState("test-session-interaction")
+	loaded, err := LoadSessionState(context.Background(), "test-session-interaction")
 	if err != nil {
 		t.Fatalf("LoadSessionState() error = %v", err)
 	}
@@ -182,12 +187,12 @@ func TestLoadSessionState_WithLastInteractionTime(t *testing.T) {
 		StepCount:           1,
 	}
 
-	err = SaveSessionState(stateOld)
+	err = SaveSessionState(context.Background(), stateOld)
 	if err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
-	loadedOld, err := LoadSessionState("test-session-no-interaction")
+	loadedOld, err := LoadSessionState(context.Background(), "test-session-no-interaction")
 	if err != nil {
 		t.Fatalf("LoadSessionState() error = %v", err)
 	}
@@ -211,7 +216,7 @@ func TestLoadSessionState_PackageLevel_NonExistent(t *testing.T) {
 
 	t.Chdir(dir)
 
-	loaded, err := LoadSessionState("nonexistent-session")
+	loaded, err := LoadSessionState(context.Background(), "nonexistent-session")
 	if err != nil {
 		t.Errorf("LoadSessionState() error = %v, want nil for nonexistent session", err)
 	}
@@ -238,13 +243,13 @@ func TestManualCommitStrategy_SessionState_UsesPackageFunctions(t *testing.T) {
 		StartedAt:  time.Now(),
 		StepCount:  2,
 	}
-	if err := SaveSessionState(state); err != nil {
+	if err := SaveSessionState(context.Background(), state); err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
 	// Load using ManualCommitStrategy method - should find the same state
 	s := &ManualCommitStrategy{}
-	loaded, err := s.loadSessionState("cross-usage-test")
+	loaded, err := s.loadSessionState(context.Background(), "cross-usage-test")
 	if err != nil {
 		t.Fatalf("ManualCommitStrategy.loadSessionState() error = %v", err)
 	}
@@ -265,12 +270,12 @@ func TestManualCommitStrategy_SessionState_UsesPackageFunctions(t *testing.T) {
 		StartedAt:  time.Now(),
 		StepCount:  1,
 	}
-	if err := s.saveSessionState(state2); err != nil {
+	if err := s.saveSessionState(context.Background(), state2); err != nil {
 		t.Fatalf("ManualCommitStrategy.saveSessionState() error = %v", err)
 	}
 
 	// Load using package-level function - should find the state
-	loaded2, err := LoadSessionState("cross-usage-test-2")
+	loaded2, err := LoadSessionState(context.Background(), "cross-usage-test-2")
 	if err != nil {
 		t.Fatalf("LoadSessionState() error = %v", err)
 	}
@@ -297,9 +302,9 @@ func TestFindMostRecentSession_FiltersByWorktree(t *testing.T) {
 	t.Chdir(dir)
 
 	// Get the resolved worktree path (git resolves symlinks, e.g. /var → /private/var on macOS)
-	resolvedDir, err := GetWorktreePath()
+	resolvedDir, err := paths.WorktreeRoot(context.Background())
 	if err != nil {
-		t.Fatalf("GetWorktreePath() error = %v", err)
+		t.Fatalf("paths.WorktreeRoot() error = %v", err)
 	}
 
 	older := time.Now().Add(-1 * time.Hour)
@@ -325,18 +330,18 @@ func TestFindMostRecentSession_FiltersByWorktree(t *testing.T) {
 		Phase:               "idle",
 	}
 
-	if err := SaveSessionState(otherWorktree); err != nil {
+	if err := SaveSessionState(context.Background(), otherWorktree); err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
-	if err := SaveSessionState(currentWorktree); err != nil {
+	if err := SaveSessionState(context.Background(), currentWorktree); err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
 	// FindMostRecentSession should return the current worktree's session,
 	// not the other worktree's session (even though it's more recent).
-	result := FindMostRecentSession()
+	result := FindMostRecentSession(context.Background())
 	if result != "current-worktree-session" {
-		t.Errorf("FindMostRecentSession() = %q, want %q (should prefer current worktree)",
+		t.Errorf("FindMostRecentSession(context.Background()) = %q, want %q (should prefer current worktree)",
 			result, "current-worktree-session")
 	}
 }
@@ -364,19 +369,301 @@ func TestFindMostRecentSession_FallsBackWhenNoWorktreeMatch(t *testing.T) {
 		Phase:               "idle",
 	}
 
-	if err := SaveSessionState(otherWorktree); err != nil {
+	if err := SaveSessionState(context.Background(), otherWorktree); err != nil {
 		t.Fatalf("SaveSessionState() error = %v", err)
 	}
 
 	// Should fall back to the only available session since none match current worktree
-	result := FindMostRecentSession()
+	result := FindMostRecentSession(context.Background())
 	if result != "only-session" {
-		t.Errorf("FindMostRecentSession() = %q, want %q (should fall back when no worktree match)",
+		t.Errorf("FindMostRecentSession(context.Background()) = %q, want %q (should fall back when no worktree match)",
 			result, "only-session")
 	}
 
 	// Cleanup
 	if err := os.Remove(dir + "/.git/entire-sessions/only-session.json"); err != nil && !os.IsNotExist(err) {
 		t.Logf("cleanup warning: %v", err)
+	}
+}
+
+// errorActionHandler returns an error from HandleCondense to test
+// that TransitionAndLog propagates handler errors while still applying the phase transition.
+type errorActionHandler struct {
+	session.NoOpActionHandler
+}
+
+func (errorActionHandler) HandleCondense(_ *session.State) error {
+	return errors.New("test condense error")
+}
+
+// TestTransitionAndLog_ReturnsHandlerError verifies that TransitionAndLog
+// applies the phase transition even when the handler returns an error,
+// and propagates that error to the caller.
+func TestTransitionAndLog_ReturnsHandlerError(t *testing.T) {
+	t.Parallel()
+
+	state := &SessionState{
+		SessionID: "test-error-handler",
+		Phase:     session.PhaseIdle,
+	}
+
+	// IDLE + GitCommit → IDLE with ActionCondense.
+	// The handler will fail on ActionCondense, but the phase should still be IDLE.
+	err := TransitionAndLog(context.Background(), state, session.EventGitCommit, session.TransitionContext{}, &errorActionHandler{})
+
+	if state.Phase != session.PhaseIdle {
+		t.Errorf("Phase = %q, want %q (should transition despite handler error)", state.Phase, session.PhaseIdle)
+	}
+	if err == nil {
+		t.Error("TransitionAndLog() should return handler error")
+	}
+}
+
+// TestLoadSessionState_DeletesStaleSession tests that LoadSessionState returns (nil, nil)
+// for a stale session and deletes the file from disk.
+func TestLoadSessionState_DeletesStaleSession(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	t.Chdir(dir)
+
+	// Create a stale session (ended >2wk ago)
+	staleInteracted := time.Now().Add(-2 * 7 * 24 * time.Hour)
+	state := &SessionState{
+		SessionID:           "stale-load-test",
+		BaseCommit:          "abc123def456",
+		StartedAt:           time.Now().Add(-3 * 7 * 24 * time.Hour),
+		LastInteractionTime: &staleInteracted,
+		StepCount:           5,
+	}
+
+	err = SaveSessionState(context.Background(), state)
+	if err != nil {
+		t.Fatalf("SaveSessionState() error = %v", err)
+	}
+
+	// Verify file exists before load
+	stateFile, err := sessionStateFile(context.Background(), "stale-load-test")
+	if err != nil {
+		t.Fatalf("sessionStateFile() error = %v", err)
+	}
+	if _, err := os.Stat(stateFile); err != nil {
+		t.Fatalf("state file should exist before load: %v", err)
+	}
+
+	// Load should return (nil, nil) for stale session
+	loaded, err := LoadSessionState(context.Background(), "stale-load-test")
+	if err != nil {
+		t.Errorf("LoadSessionState() error = %v, want nil for stale session", err)
+	}
+	if loaded != nil {
+		t.Error("LoadSessionState() returned non-nil for stale session")
+	}
+
+	// File should be deleted from disk
+	if _, err := os.Stat(stateFile); !os.IsNotExist(err) {
+		t.Error("stale session file should be deleted after LoadSessionState()")
+	}
+}
+
+// --- Model hint file tests ---
+
+func TestStoreModelHint_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	ctx := context.Background()
+	sessionID := "2026-01-01-hint-roundtrip"
+
+	err = StoreModelHint(ctx, sessionID, "claude-sonnet-4-20250514")
+	if err != nil {
+		t.Fatalf("StoreModelHint() error = %v", err)
+	}
+
+	got := LoadModelHint(ctx, sessionID)
+	if got != "claude-sonnet-4-20250514" {
+		t.Errorf("LoadModelHint() = %q, want %q", got, "claude-sonnet-4-20250514")
+	}
+}
+
+func TestStoreModelHint_EmptyModel_NoOp(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	ctx := context.Background()
+	sessionID := "2026-01-01-hint-empty"
+
+	err = StoreModelHint(ctx, sessionID, "")
+	if err != nil {
+		t.Fatalf("StoreModelHint() error = %v", err)
+	}
+
+	// No file should have been created
+	stateDir, sdErr := getSessionStateDir(ctx)
+	if sdErr != nil {
+		t.Fatalf("getSessionStateDir() error = %v", sdErr)
+	}
+	hintPath := stateDir + "/" + sessionID + ".model"
+	if _, statErr := os.Stat(hintPath); !os.IsNotExist(statErr) {
+		t.Error("StoreModelHint with empty model should not create a file")
+	}
+}
+
+func TestLoadModelHint_NoFile_ReturnsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	got := LoadModelHint(context.Background(), "2026-01-01-nonexistent")
+	if got != "" {
+		t.Errorf("LoadModelHint() = %q, want empty string for missing file", got)
+	}
+}
+
+func TestStoreModelHint_InvalidSessionID_ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	err = StoreModelHint(context.Background(), "../../../etc/passwd", "model")
+	if err == nil {
+		t.Error("StoreModelHint() should return error for invalid session ID")
+	}
+}
+
+func TestLoadModelHint_InvalidSessionID_ReturnsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	got := LoadModelHint(context.Background(), "../../../etc/passwd")
+	if got != "" {
+		t.Errorf("LoadModelHint() = %q, want empty for invalid session ID", got)
+	}
+}
+
+func TestLoadModelHint_TrimsWhitespace(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	ctx := context.Background()
+	sessionID := "2026-01-01-hint-whitespace"
+
+	// Write hint with trailing newline (simulating manual edit)
+	stateDir, sdErr := getSessionStateDir(ctx)
+	if sdErr != nil {
+		t.Fatalf("getSessionStateDir() error = %v", sdErr)
+	}
+	if mkErr := os.MkdirAll(stateDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll() error = %v", mkErr)
+	}
+	hintPath := stateDir + "/" + sessionID + ".model"
+	if wErr := os.WriteFile(hintPath, []byte("claude-opus-4-6\n"), 0o600); wErr != nil {
+		t.Fatalf("WriteFile() error = %v", wErr)
+	}
+
+	got := LoadModelHint(ctx, sessionID)
+	if got != "claude-opus-4-6" {
+		t.Errorf("LoadModelHint() = %q, want %q (should trim whitespace)", got, "claude-opus-4-6")
+	}
+}
+
+func TestClearSessionState_RemovesHintFile(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	ctx := context.Background()
+	sessionID := "2026-01-01-clear-hint"
+
+	// Create both state and hint files
+	state := &SessionState{
+		SessionID:  sessionID,
+		BaseCommit: "abc123",
+		StartedAt:  time.Now(),
+	}
+	if sErr := SaveSessionState(ctx, state); sErr != nil {
+		t.Fatalf("SaveSessionState() error = %v", sErr)
+	}
+	if sErr := StoreModelHint(ctx, sessionID, "some-model"); sErr != nil {
+		t.Fatalf("StoreModelHint() error = %v", sErr)
+	}
+
+	// Clear should remove both
+	if cErr := ClearSessionState(ctx, sessionID); cErr != nil {
+		t.Fatalf("ClearSessionState() error = %v", cErr)
+	}
+
+	stateDir, sdErr := getSessionStateDir(ctx)
+	if sdErr != nil {
+		t.Fatalf("getSessionStateDir() error = %v", sdErr)
+	}
+	matches, err := filepath.Glob(filepath.Join(stateDir, sessionID+".*"))
+	if err != nil {
+		t.Fatalf("filepath.Glob() error = %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("expected no files for session after clear, found: %v", matches)
+	}
+}
+
+func TestClearSessionState_RemovesOrphanedHintFile(t *testing.T) {
+	dir := t.TempDir()
+	_, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	t.Chdir(dir)
+
+	ctx := context.Background()
+	sessionID := "2026-01-01-orphan-hint"
+
+	// Only create hint file (no state file)
+	if sErr := StoreModelHint(ctx, sessionID, "orphan-model"); sErr != nil {
+		t.Fatalf("StoreModelHint() error = %v", sErr)
+	}
+
+	// Clear should succeed and remove the hint file
+	if cErr := ClearSessionState(ctx, sessionID); cErr != nil {
+		t.Fatalf("ClearSessionState() error = %v", cErr)
+	}
+
+	stateDir, sdErr := getSessionStateDir(ctx)
+	if sdErr != nil {
+		t.Fatalf("getSessionStateDir() error = %v", sdErr)
+	}
+	matches, err := filepath.Glob(filepath.Join(stateDir, sessionID+".*"))
+	if err != nil {
+		t.Fatalf("filepath.Glob() error = %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("expected no files for session after clear, found: %v", matches)
 	}
 }

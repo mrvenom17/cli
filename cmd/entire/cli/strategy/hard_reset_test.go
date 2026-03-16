@@ -1,13 +1,14 @@
 package strategy
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // TestHardResetWithProtection_PreservesProtectedDirs verifies that HardResetWithProtection
@@ -90,7 +91,7 @@ func TestHardResetWithProtection_PreservesProtectedDirs(t *testing.T) {
 	t.Chdir(repoDir)
 
 	// Perform hard reset to initial commit
-	shortID, err := HardResetWithProtection(initialCommit)
+	shortID, err := HardResetWithProtection(context.Background(), initialCommit)
 	if err != nil {
 		t.Fatalf("HardResetWithProtection failed: %v", err)
 	}

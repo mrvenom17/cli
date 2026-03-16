@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,8 +12,8 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/spf13/cobra"
 )
 
@@ -24,11 +25,17 @@ func newDoctorCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Fix stuck sessions",
-		Long: `Scan for stuck or problematic sessions and offer to fix them.
+		Short: "Diagnose and fix session issues",
+		Long: `Scan for session issues and offer to fix them.
+
+Checks performed:
+  1. Disconnected metadata branches: detects when local and remote
+     entire/checkpoints/v1 branches share no common ancestor (caused by a
+     previous bug). Fixes by cherry-picking local checkpoints onto remote tip.
+  2. Stuck sessions: sessions stuck in ACTIVE or ENDED phase that need cleanup.
 
 A session is considered stuck if:
-  - It is in ACTIVE or ACTIVE_COMMITTED phase with no interaction for over 1 hour
+  - It is in ACTIVE phase with no interaction for over 1 hour
   - It is in ENDED phase with uncondensed checkpoint data on a shadow branch
 
 For each stuck session, you can choose to:
@@ -36,14 +43,13 @@ For each stuck session, you can choose to:
   - Discard: Remove the session state and shadow branch data
   - Skip: Leave the session as-is
 
-Use --force to condense all fixable sessions without prompting.  Sessions that can't
-be condensed will be discarded.`,
+Use --force to auto-fix all issues without prompting.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSessionsFix(cmd, forceFlag)
 		},
 	}
 
-	cmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Fix all stuck sessions without prompting (condense if possible, otherwise discard)")
+	cmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Auto-fix all issues without prompting")
 
 	return cmd
 }
@@ -59,19 +65,31 @@ type stuckSession struct {
 }
 
 func runSessionsFix(cmd *cobra.Command, force bool) error {
+	// Check 1: Disconnected metadata branches
+	metadataErr := checkDisconnectedMetadata(cmd, force)
+	if metadataErr != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Error: metadata check failed: %v\n", metadataErr)
+	}
+	fmt.Fprintln(cmd.OutOrStdout())
+
+	// Check 2: Stuck sessions
+	ctx := cmd.Context()
 	// Load all session states
-	states, err := strategy.ListSessionStates()
+	states, err := strategy.ListSessionStates(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list session states: %w", err)
 	}
 
 	if len(states) == 0 {
 		fmt.Fprintln(cmd.OutOrStdout(), "No stuck sessions found.")
+		if metadataErr != nil {
+			return fmt.Errorf("metadata check failed: %w", metadataErr)
+		}
 		return nil
 	}
 
 	// Open repository to check shadow branches (uses worktree-aware helper)
-	repo, err := openRepository()
+	repo, err := openRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to open repository: %w", err)
 	}
@@ -89,12 +107,14 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 
 	if len(stuck) == 0 {
 		fmt.Fprintln(cmd.OutOrStdout(), "No stuck sessions found.")
+		if metadataErr != nil {
+			return fmt.Errorf("metadata check failed: %w", metadataErr)
+		}
 		return nil
 	}
 
 	// Get the current strategy for condense operations
-	strat := GetStrategy()
-	condenser, canCondense := strat.(strategy.SessionCondenser)
+	strat := GetStrategy(ctx)
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Found %d stuck session(s):\n\n", len(stuck))
 
@@ -102,15 +122,15 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 		displayStuckSession(cmd, ss)
 
 		if force {
-			if canCondense && ss.HasShadowBranch && ss.CheckpointCount > 0 {
-				if err := condenser.CondenseSessionByID(ss.State.SessionID); err != nil {
+			if ss.HasShadowBranch && ss.CheckpointCount > 0 {
+				if err := strat.CondenseSessionByID(ctx, ss.State.SessionID); err != nil {
 					fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to condense session %s: %v\n", ss.State.SessionID, err)
 				} else {
 					fmt.Fprintf(cmd.OutOrStdout(), "  -> Condensed session %s\n\n", ss.State.SessionID)
 				}
 			} else {
 				// Discard if we can't condense
-				if err := discardSession(ss, repo, cmd.ErrOrStderr()); err != nil {
+				if err := discardSession(ctx, ss, repo, cmd.ErrOrStderr()); err != nil {
 					fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to discard session %s: %v\n", ss.State.SessionID, err)
 				} else {
 					fmt.Fprintf(cmd.OutOrStdout(), "  -> Discarded session %s\n\n", ss.State.SessionID)
@@ -120,7 +140,7 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 		}
 
 		// Interactive: prompt for action
-		action, err := promptSessionAction(ss, canCondense)
+		action, err := promptSessionAction(ss)
 		if err != nil {
 			if errors.Is(err, huh.ErrUserAborted) {
 				return nil
@@ -130,17 +150,13 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 
 		switch action {
 		case "condense":
-			if !canCondense {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Strategy %s does not support condensation\n", strat.Name())
-				continue
-			}
-			if err := condenser.CondenseSessionByID(ss.State.SessionID); err != nil {
+			if err := strat.CondenseSessionByID(ctx, ss.State.SessionID); err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to condense session %s: %v\n", ss.State.SessionID, err)
 			} else {
 				fmt.Fprintf(cmd.OutOrStdout(), "  -> Condensed session %s\n\n", ss.State.SessionID)
 			}
 		case "discard":
-			if err := discardSession(ss, repo, cmd.ErrOrStderr()); err != nil {
+			if err := discardSession(ctx, ss, repo, cmd.ErrOrStderr()); err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to discard session %s: %v\n", ss.State.SessionID, err)
 			} else {
 				fmt.Fprintf(cmd.OutOrStdout(), "  -> Discarded session %s\n\n", ss.State.SessionID)
@@ -148,6 +164,10 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 		case "skip":
 			fmt.Fprintf(cmd.OutOrStdout(), "  -> Skipped\n\n")
 		}
+	}
+
+	if metadataErr != nil {
+		return fmt.Errorf("metadata check failed: %w", metadataErr)
 	}
 
 	return nil
@@ -231,11 +251,11 @@ func displayStuckSession(cmd *cobra.Command, ss stuckSession) {
 }
 
 // promptSessionAction asks the user what to do with a stuck session.
-func promptSessionAction(ss stuckSession, canCondense bool) (string, error) {
+func promptSessionAction(ss stuckSession) (string, error) {
 	var action string
 
 	options := make([]huh.Option[string], 0, 3)
-	if canCondense && ss.HasShadowBranch && ss.CheckpointCount > 0 {
+	if ss.HasShadowBranch && ss.CheckpointCount > 0 {
 		options = append(options, huh.NewOption("Condense (save to permanent storage)", "condense"))
 	}
 	options = append(options,
@@ -260,18 +280,18 @@ func promptSessionAction(ss stuckSession, canCondense bool) (string, error) {
 }
 
 // discardSession removes session state and cleans up the shadow branch.
-func discardSession(ss stuckSession, _ *git.Repository, errW io.Writer) error {
+func discardSession(ctx context.Context, ss stuckSession, _ *git.Repository, errW io.Writer) error {
 	// Clear session state file
-	if err := strategy.ClearSessionState(ss.State.SessionID); err != nil {
+	if err := strategy.ClearSessionState(ctx, ss.State.SessionID); err != nil {
 		return fmt.Errorf("failed to clear session state: %w", err)
 	}
 
 	// Delete shadow branch if it exists and no other sessions need it
 	if ss.HasShadowBranch {
-		if shouldDelete, err := canDeleteShadowBranch(ss.ShadowBranch, ss.State.SessionID); err != nil {
+		if shouldDelete, err := canDeleteShadowBranch(ctx, ss.ShadowBranch, ss.State.SessionID); err != nil {
 			fmt.Fprintf(errW, "Warning: could not check other sessions for shadow branch: %v\n", err)
 		} else if shouldDelete {
-			if err := strategy.DeleteBranchCLI(ss.ShadowBranch); err != nil {
+			if err := strategy.DeleteBranchCLI(ctx, ss.ShadowBranch); err != nil {
 				// Branch already gone is not an error — keeps discard idempotent
 				if !errors.Is(err, strategy.ErrBranchNotFound) {
 					return fmt.Errorf("failed to delete shadow branch: %w", err)
@@ -283,10 +303,65 @@ func discardSession(ss stuckSession, _ *git.Repository, errW io.Writer) error {
 	return nil
 }
 
+// checkDisconnectedMetadata detects and optionally repairs disconnected
+// local/remote metadata branches (the "empty-orphan bug").
+func checkDisconnectedMetadata(cmd *cobra.Command, force bool) error {
+	repo, err := openRepository(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	ctx := cmd.Context()
+	disconnected, err := strategy.IsMetadataDisconnected(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("could not check metadata branch state: %w", err)
+	}
+
+	w := cmd.OutOrStdout()
+
+	if !disconnected {
+		fmt.Fprintln(w, "Metadata branches: OK")
+		return nil
+	}
+
+	fmt.Fprintln(w, "Metadata branches: DISCONNECTED")
+	fmt.Fprintln(w, "  Local and remote entire/checkpoints/v1 branches share no common ancestor.")
+	fmt.Fprintln(w, "  Some remote checkpoints may not be visible locally.")
+	fmt.Fprintln(w, "  Fix: cherry-pick local checkpoints onto remote tip (preserves all data).")
+
+	if !force {
+		var confirmed bool
+		form := NewAccessibleForm(
+			huh.NewGroup(
+				huh.NewConfirm().
+					Title("Fix disconnected metadata branches?").
+					Value(&confirmed),
+			),
+		)
+		if formErr := form.Run(); formErr != nil {
+			if errors.Is(formErr, huh.ErrUserAborted) {
+				return nil
+			}
+			return fmt.Errorf("prompt failed: %w", formErr)
+		}
+		if !confirmed {
+			fmt.Fprintln(w, "  -> Skipped")
+			return nil
+		}
+	}
+
+	if fixErr := strategy.ReconcileDisconnectedMetadataBranch(ctx, repo, cmd.ErrOrStderr()); fixErr != nil {
+		return fmt.Errorf("failed to reconcile metadata branches: %w", fixErr)
+	}
+
+	fmt.Fprintln(w, "  -> Fixed: metadata branches reconciled")
+	return nil
+}
+
 // canDeleteShadowBranch checks if a shadow branch can be safely deleted.
 // Returns true if no other sessions (besides excludeSessionID) need this branch.
-func canDeleteShadowBranch(shadowBranch, excludeSessionID string) (bool, error) {
-	states, err := strategy.ListSessionStates()
+func canDeleteShadowBranch(ctx context.Context, shadowBranch, excludeSessionID string) (bool, error) {
+	states, err := strategy.ListSessionStates(ctx)
 	if err != nil {
 		return false, fmt.Errorf("failed to list session states: %w", err)
 	}

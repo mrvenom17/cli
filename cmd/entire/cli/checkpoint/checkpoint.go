@@ -12,9 +12,10 @@ import (
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 // Errors returned by checkpoint operations.
@@ -86,13 +87,13 @@ type Store interface {
 
 	// ReadCommitted reads a committed checkpoint's summary by ID.
 	// Returns only the CheckpointSummary (paths + aggregated stats), not actual content.
-	// Use ReadSessionContent to read actual transcript/prompts/context.
+	// Use ReadSessionContent to read actual transcript/prompts.
 	// Returns nil, nil if the checkpoint does not exist.
 	ReadCommitted(ctx context.Context, checkpointID id.CheckpointID) (*CheckpointSummary, error)
 
 	// ReadSessionContent reads the actual content for a specific session within a checkpoint.
 	// sessionIndex is 0-based (0 for first session, 1 for second, etc.).
-	// Returns the session's metadata, transcript, prompts, and context.
+	// Returns the session's metadata, transcript, and prompts.
 	ReadSessionContent(ctx context.Context, checkpointID id.CheckpointID, sessionIndex int) (*SessionContent, error)
 
 	// ReadSessionContentByID reads a session's content by its session ID.
@@ -101,6 +102,12 @@ type Store interface {
 
 	// ListCommitted lists all committed checkpoints.
 	ListCommitted(ctx context.Context) ([]CommittedInfo, error)
+
+	// UpdateCommitted replaces the transcript and prompts for an existing
+	// committed checkpoint. Used at stop time to finalize checkpoints with the full
+	// session transcript (prompt to stop event).
+	// Returns ErrCheckpointNotFound if the checkpoint doesn't exist.
+	UpdateCommitted(ctx context.Context, opts UpdateCommittedOptions) error
 }
 
 // WriteTemporaryResult contains the result of writing a temporary checkpoint.
@@ -210,9 +217,6 @@ type WriteCommittedOptions struct {
 	// Prompts contains user prompts from the session
 	Prompts []string
 
-	// Context is the generated context.md content
-	Context []byte
-
 	// FilesTouched are files modified during the session
 	FilesTouched []string
 
@@ -233,7 +237,7 @@ type WriteCommittedOptions struct {
 	// This is useful for copying task metadata files, subagent transcripts, etc.
 	MetadataDir string
 
-	// Task checkpoint fields (for auto-commit strategy task checkpoints)
+	// Task checkpoint fields (for task/subagent checkpoints)
 	IsTask    bool   // Whether this is a task checkpoint
 	ToolUseID string // Tool use ID for task checkpoints
 
@@ -253,7 +257,13 @@ type WriteCommittedOptions struct {
 	CommitSubject string // Subject line for the metadata commit (overrides default)
 
 	// Agent identifies the agent that created this checkpoint (e.g., "Claude Code", "Cursor")
-	Agent agent.AgentType
+	Agent types.AgentType
+
+	// Model is the LLM model used during the session (e.g., "claude-sonnet-4-20250514")
+	Model string
+
+	// TurnID correlates checkpoints from the same agent turn.
+	TurnID string
 
 	// Transcript position at checkpoint start - tracks what was added during this checkpoint
 	TranscriptIdentifierAtStart string // Last identifier when checkpoint started (UUID for Claude, message ID for Gemini)
@@ -264,6 +274,9 @@ type WriteCommittedOptions struct {
 
 	// TokenUsage contains the token usage for this checkpoint
 	TokenUsage *agent.TokenUsage
+
+	// SessionMetrics contains hook-provided session metrics (duration, turns, context usage)
+	SessionMetrics *SessionMetrics
 
 	// InitialAttribution is line-level attribution calculated at commit time
 	// comparing checkpoint tree (agent work) to committed tree (may include human edits)
@@ -276,11 +289,27 @@ type WriteCommittedOptions struct {
 	//   - the transcript was empty or too short to summarize
 	//   - the checkpoint predates the summarization feature
 	Summary *Summary
+}
 
-	// SessionTranscriptPath is the home-relative path to the session transcript file.
-	// Persisted in CommittedMetadata so restore can write the transcript back to
-	// the correct location without reconstructing agent-specific paths.
-	SessionTranscriptPath string
+// UpdateCommittedOptions contains options for updating an existing committed checkpoint.
+// Uses replace semantics: the transcript and prompts are fully replaced,
+// not appended. At stop time we have the complete session transcript and want every
+// checkpoint to contain it identically.
+type UpdateCommittedOptions struct {
+	// CheckpointID identifies the checkpoint to update
+	CheckpointID id.CheckpointID
+
+	// SessionID identifies which session slot to update within the checkpoint
+	SessionID string
+
+	// Transcript is the full session transcript (replaces existing)
+	Transcript []byte
+
+	// Prompts contains all user prompts (replaces existing)
+	Prompts []string
+
+	// Agent identifies the agent type (needed for transcript chunking)
+	Agent types.AgentType
 }
 
 // CommittedInfo contains summary information about a committed checkpoint.
@@ -301,7 +330,7 @@ type CommittedInfo struct {
 	FilesTouched []string
 
 	// Agent identifies the agent that created this checkpoint
-	Agent agent.AgentType
+	Agent types.AgentType
 
 	// IsTask indicates if this is a task checkpoint
 	IsTask bool
@@ -326,9 +355,6 @@ type SessionContent struct {
 
 	// Prompts contains user prompts from this session
 	Prompts string
-
-	// Context is the context.md content
-	Context string
 }
 
 // CommittedMetadata contains the metadata stored in metadata.json for each checkpoint.
@@ -343,7 +369,15 @@ type CommittedMetadata struct {
 	FilesTouched     []string        `json:"files_touched"`
 
 	// Agent identifies the agent that created this checkpoint (e.g., "Claude Code", "Cursor")
-	Agent agent.AgentType `json:"agent,omitempty"`
+	Agent types.AgentType `json:"agent,omitempty"`
+
+	// Model is the LLM model used during the session (e.g., "claude-sonnet-4-20250514")
+	Model string `json:"model,omitempty"`
+
+	// TurnID correlates checkpoints from the same agent turn.
+	// When a turn's work spans multiple commits, each gets its own checkpoint
+	// but they share the same TurnID for future aggregation/deduplication.
+	TurnID string `json:"turn_id,omitempty"`
 
 	// Task checkpoint fields (only populated for task checkpoints)
 	IsTask    bool   `json:"is_task,omitempty"`
@@ -359,16 +393,15 @@ type CommittedMetadata struct {
 	// Token usage for this checkpoint
 	TokenUsage *agent.TokenUsage `json:"token_usage,omitempty"`
 
+	// SessionMetrics contains hook-provided session metrics (duration, turns, context usage).
+	// Populated for agents that provide these metrics via hooks (e.g., Cursor).
+	SessionMetrics *SessionMetrics `json:"session_metrics,omitempty"`
+
 	// AI-generated summary of the checkpoint
 	Summary *Summary `json:"summary,omitempty"`
 
 	// InitialAttribution is line-level attribution calculated at commit time
 	InitialAttribution *InitialAttribution `json:"initial_attribution,omitempty"`
-
-	// TranscriptPath is the home-relative path to the session transcript file.
-	// Persisted so restore can write the transcript back to the correct location
-	// without needing to reconstruct agent-specific paths (e.g. SHA-256 hashed dirs for Gemini).
-	TranscriptPath string `json:"transcript_path,omitempty"`
 }
 
 // GetTranscriptStart returns the transcript line offset at which this checkpoint's data begins.
@@ -387,7 +420,6 @@ func (m CommittedMetadata) GetTranscriptStart() int {
 type SessionFilePaths struct {
 	Metadata    string `json:"metadata"`
 	Transcript  string `json:"transcript"`
-	Context     string `json:"context"`
 	ContentHash string `json:"content_hash"`
 	Prompt      string `json:"prompt"`
 }
@@ -405,7 +437,6 @@ type SessionFilePaths struct {
 //	│   ├── metadata.json     # Session-specific CommittedMetadata
 //	│   ├── full.jsonl
 //	│   ├── prompt.txt
-//	│   ├── context.md
 //	│   └── content_hash.txt
 //	├── 2/                    # Second session
 //	└── 3/                    # Third session...
@@ -420,6 +451,16 @@ type CheckpointSummary struct {
 	FilesTouched     []string           `json:"files_touched"`
 	Sessions         []SessionFilePaths `json:"sessions"`
 	TokenUsage       *agent.TokenUsage  `json:"token_usage,omitempty"`
+}
+
+// SessionMetrics contains hook-provided session metrics from agents that report
+// them via lifecycle hooks (e.g., Cursor). These supplement transcript-derived
+// metrics for agents whose transcripts lack usage/timing data.
+type SessionMetrics struct {
+	DurationMs        int64 `json:"duration_ms,omitempty"`
+	TurnCount         int   `json:"turn_count,omitempty"`
+	ContextTokens     int   `json:"context_tokens,omitempty"`
+	ContextWindowSize int   `json:"context_window_size,omitempty"`
 }
 
 // Summary contains AI-generated summary of a checkpoint.
