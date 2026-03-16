@@ -387,7 +387,7 @@ func TestStateStore_Load_NonexistentDir(t *testing.T) {
 	// When the state directory doesn't exist, Load should return (nil, nil)
 	store := NewStateStoreWithDir(filepath.Join(t.TempDir(), "nonexistent", "entire-sessions"))
 	state, err := store.Load(context.Background(), "some-session")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Nil(t, state)
 }
 
