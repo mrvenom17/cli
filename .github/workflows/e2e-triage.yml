@@ -128,6 +128,7 @@ jobs:
         shell: bash
         env:
           RUN_URL: ${{ needs.matrix-setup.outputs.run_url }}
+          E2E_AGENT: ${{ matrix.agent }}
         run: |
           set -euo pipefail
 
