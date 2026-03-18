@@ -122,5 +122,5 @@ func CollectTranscriptBlobHashes(tree *object.Tree, checkpointID id.CheckpointID
 		}
 	}
 
-	return refs, nil //nolint:nilerr // err from line 85 was handled by early return
+	return refs, nil //nolint:nilerr // treeErr from session enumeration loop is used to break, not propagated
 }
