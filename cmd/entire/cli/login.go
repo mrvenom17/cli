@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"os/exec"
 	"runtime"
 	"time"
@@ -32,7 +34,6 @@ type deviceAuthClient interface {
 }
 
 func newLoginCmd() *cobra.Command {
-	var printBrowserURL bool
 	var insecureHTTPAuth bool
 
 	cmd := &cobra.Command{
@@ -47,11 +48,10 @@ func newLoginCmd() *cobra.Command {
 				}
 			}
 
-			return runLogin(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), client, openBrowser, printBrowserURL)
+			return runLogin(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), client, openBrowser)
 		},
 	}
 
-	cmd.Flags().BoolVar(&printBrowserURL, "print-browser-url", false, "Print the approval URL instead of opening a browser")
 	cmd.Flags().BoolVar(&insecureHTTPAuth, "insecure-http-auth", false, "Allow authentication over plain HTTP (insecure, for local development only)")
 	if err := cmd.Flags().MarkHidden("insecure-http-auth"); err != nil {
 		panic(fmt.Sprintf("hide insecure-http-auth flag: %v", err))
@@ -60,7 +60,7 @@ func newLoginCmd() *cobra.Command {
 	return cmd
 }
 
-func runLogin(ctx context.Context, outW, errW io.Writer, client deviceAuthClient, openURL browserOpenFunc, printBrowserURL bool) error {
+func runLogin(ctx context.Context, outW, errW io.Writer, client deviceAuthClient, openURL browserOpenFunc) error {
 	start, err := client.StartDeviceAuth(ctx)
 	if err != nil {
 		return fmt.Errorf("start login: %w", err)
@@ -72,17 +72,20 @@ func runLogin(ctx context.Context, outW, errW io.Writer, client deviceAuthClient
 		approvalURL = start.VerificationURI
 	}
 
-	fmt.Fprintf(outW, "Approval URL: %s\n", approvalURL)
+	if canPromptInteractively() {
+		fmt.Fprintf(outW, "Press Enter to open %s in your browser...", approvalURL)
 
-	if printBrowserURL {
-		fmt.Fprintln(outW, "Open the approval URL in your browser to continue.")
+		// Read from /dev/tty so we get a real keypress and don't consume piped stdin.
+		waitForEnter()
+
+		fmt.Fprintln(outW)
 	} else {
-		if err := openURL(ctx, approvalURL); err != nil {
-			fmt.Fprintf(errW, "Warning: failed to open browser automatically: %v\n", err)
-			fmt.Fprintln(outW, "Open the approval URL in your browser to continue.")
-		} else {
-			fmt.Fprintln(outW, "Opened your browser for approval.")
-		}
+		fmt.Fprintf(outW, "Approval URL: %s\n", approvalURL)
+	}
+
+	if err := openURL(ctx, approvalURL); err != nil {
+		fmt.Fprintf(errW, "Warning: failed to open browser: %v\n", err)
+		fmt.Fprintln(outW, "Open the approval URL in your browser to continue.")
 	}
 
 	fmt.Fprintln(outW, "Waiting for approval...")
@@ -162,6 +165,21 @@ func waitForApproval(ctx context.Context, poller deviceAuthClient, deviceCode st
 			return "", fmt.Errorf("wait for approval: %w", ctx.Err())
 		case <-time.After(pollInterval):
 		}
+	}
+}
+
+// waitForEnter reads a line from /dev/tty, blocking until the user presses Enter.
+// If /dev/tty cannot be opened (e.g. on Windows), it returns immediately.
+func waitForEnter() {
+	tty, err := os.Open("/dev/tty")
+	if err != nil {
+		return
+	}
+	defer tty.Close()
+
+	reader := bufio.NewReader(tty)
+	if _, err = reader.ReadString('\n'); err != nil {
+		return
 	}
 }
 
