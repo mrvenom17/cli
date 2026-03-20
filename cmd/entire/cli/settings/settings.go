@@ -485,8 +485,8 @@ func (s *EntireSettings) IsCheckpointsV2Enabled() bool {
 	if s.StrategyOptions == nil {
 		return false
 	}
-	val, exists := s.StrategyOptions["checkpoints_v2"].(bool)
-	return exists && val
+	val, ok := s.StrategyOptions["checkpoints_v2"].(bool)
+	return ok && val
 }
 
 // IsPushSessionsDisabled checks if push_sessions is disabled in settings.
