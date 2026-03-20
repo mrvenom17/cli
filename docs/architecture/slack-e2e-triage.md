@@ -1,60 +1,62 @@
 # Slack-Triggered E2E Triage
 
-This flow lets a human reply `triage e2e` in the thread of an E2E failure alert and have GitHub Actions run the existing triage workflow.
+When E2E tests fail on `main`, a Slack alert is posted with a clickable "Run Triage" link. Clicking it triggers the triage workflow via a Cloudflare Worker.
 
 ## Flow
 
-1. `.github/workflows/e2e.yml` posts the failure alert and includes machine-readable metadata.
-2. `cmd/e2e-triage-dispatch` listens for Slack thread replies, validates the reply text, fetches the parent alert, and dispatches GitHub.
-3. `.github/workflows/e2e-triage.yml` checks out the failed SHA, runs the Claude triage skill, and posts results back to the Slack thread.
+1. `.github/workflows/e2e.yml` posts a failure alert to Slack using the bot token (via `chat.postMessage`), then posts a threaded "Run Triage" link that encodes the run URL and Slack thread context.
+2. A user clicks the link, which hits the Cloudflare Worker at `e2e-triage.entireio.workers.dev`.
+3. The Worker validates the `run_url` and calls `workflow_dispatch` on `.github/workflows/e2e-triage.yml` via the GitHub API.
+4. The triage workflow checks out the failed SHA, runs the Claude triage skill per failed agent, and posts results back to the Slack thread.
 
-The trigger is the exact normalized text `triage e2e`.
+```
+E2E fails -> bot posts alert to Slack (with "Run Triage" link)
+  -> user clicks link -> Cloudflare Worker -> GitHub API (workflow_dispatch)
+    -> e2e-triage.yml runs -> posts results back to Slack thread
+```
+
+## Cloudflare Worker
+
+Located in `workers/e2e-triage-trigger/`.
+
+Accepts a GET request at `/triage` with query parameters:
+
+- `run_url` (required) — must match `https://github.com/entireio/cli/actions/runs/\d+`
+- `slack_channel` — Slack channel ID for thread replies
+- `slack_thread_ts` — Slack thread timestamp for thread replies
+
+The Worker dispatches `e2e-triage.yml` with these values as `workflow_dispatch` inputs.
+
+**Secret:** `GITHUB_TOKEN` — a PAT with `actions:write` scope, stored in Cloudflare secrets (`wrangler secret put GITHUB_TOKEN`).
 
 ## Slack Setup
 
-Slack app requirements:
+The Slack app needs:
 
-- Event subscription for `message.channels` so the app receives public channel thread replies
-- `channels:history` so the app can read the parent E2E alert message
-- `chat:write` so the app can post status updates back into the thread
+- `chat:write` scope — to post alerts and triage results
+- Bot must be invited to the alert channel
 
-If you want private-channel support, add the equivalent `groups:history` event and scope as well.
+No event subscriptions or incoming webhooks are needed.
 
-## GitHub And Runtime Config
+## GitHub Config
 
-`cmd/e2e-triage-dispatch` uses these environment variables:
+**Repository variables:**
 
-- `SLACK_SIGNING_SECRET`
-- `SLACK_BOT_TOKEN`
-- `GITHUB_TOKEN`
-- `ALLOWED_REPOSITORY` or `GITHUB_REPOSITORY`
-- `ADDR` optional, defaults to `:8080`
-- `GITHUB_EVENT_TYPE` optional, defaults to `slack_e2e_triage_requested`
-- `SLACK_API_BASE_URL` optional, defaults to `https://slack.com/api`
-- `GITHUB_API_BASE_URL` optional, defaults to `https://api.github.com`
-- `SLACK_REQUEST_TOLERANCE` optional, defaults to `5m`
+- `E2E_SLACK_CHANNEL` — Slack channel ID where failure alerts are posted
 
-The GitHub Actions workflow uses these secrets:
+**Repository secrets:**
 
-- `ANTHROPIC_API_KEY` for Claude triage
-- `SLACK_BOT_TOKEN` for start and completion replies
-- The built-in `${{ github.token }}` for repository dispatch and repository checkout
+- `SLACK_BOT_TOKEN` — Slack bot token with `chat:write` scope
+- `ANTHROPIC_API_KEY` — for Claude triage
 
-The externally deployed `cmd/e2e-triage-dispatch` service uses `GITHUB_TOKEN` to call the GitHub dispatch API.
+The built-in `${{ github.token }}` is used for GitHub API calls within workflows.
 
 ## Manual Fallback
 
-If Slack dispatch is unavailable, you can run `.github/workflows/e2e-triage.yml` manually with `workflow_dispatch`.
+Run `.github/workflows/e2e-triage.yml` manually with `workflow_dispatch`:
 
-Required inputs:
-
-- `run_url`
-- `sha`
-- `failed_agents`
-
-Optional inputs:
-
-- `slack_channel`
-- `slack_thread_ts`
-
-This is the fallback path for ad hoc triage when you already have the failed run URL and commit SHA.
+- `run_url` (required) — the failed run URL
+- `sha` — commit SHA (auto-detected from run if omitted)
+- `failed_agents` — comma-separated list (auto-detected from run if omitted)
+- `slack_channel` — for Slack thread replies
+- `slack_thread_ts` — for Slack thread replies

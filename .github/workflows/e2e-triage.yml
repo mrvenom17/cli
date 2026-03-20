@@ -1,9 +1,6 @@
 name: E2E Triage
 
 on:
-  repository_dispatch:
-    types:
-      - slack_e2e_triage_requested
   workflow_dispatch:
     inputs:
       run_url:
@@ -46,7 +43,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
           REPO_NAME: ${{ github.repository }}
           RUN_URL_INPUT: ${{ inputs.run_url }}
           SHA_INPUT: ${{ inputs.sha }}
@@ -60,58 +56,29 @@ jobs:
             printf '%s' "$1" | jq -R -s -c 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))'
           }
 
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            run_url="$RUN_URL_INPUT"
-            sha="${SHA_INPUT:-}"
-            slack_channel="${SLACK_CHANNEL_INPUT:-}"
-            slack_thread_ts="${SLACK_THREAD_TS_INPUT:-}"
+          run_url="$RUN_URL_INPUT"
+          sha="${SHA_INPUT:-}"
+          slack_channel="${SLACK_CHANNEL_INPUT:-}"
+          slack_thread_ts="${SLACK_THREAD_TS_INPUT:-}"
 
-            # Derive missing values from run URL via GitHub API
-            if [ -z "$sha" ] || [ -z "$FAILED_AGENTS_INPUT" ]; then
-              run_id=$(echo "$run_url" | grep -oE '/runs/[0-9]+' | grep -oE '[0-9]+')
-              if [ -z "$run_id" ]; then
-                echo "Could not extract run ID from run_url: $run_url" >&2
-                exit 1
-              fi
-              run_data=$(gh run view "$run_id" --repo "$REPO_NAME" --json headSha,jobs)
-              if [ -z "$sha" ]; then
-                sha=$(echo "$run_data" | jq -r '.headSha')
-              fi
-              if [ -z "$FAILED_AGENTS_INPUT" ]; then
-                agents_json=$(echo "$run_data" | jq -c '[.jobs[] | select(.conclusion == "failure") | .name | capture("\\((?<agent>[^)]+)\\)") | .agent]')
-              fi
-            fi
-
-            if [ -n "$FAILED_AGENTS_INPUT" ]; then
-              agents_json="$(csv_to_json "$FAILED_AGENTS_INPUT")"
-            fi
-          else
-            trigger_text="$(jq -r '.client_payload.trigger_text // empty' "$GITHUB_EVENT_PATH")"
-            repo="$(jq -r '.client_payload.repo // empty' "$GITHUB_EVENT_PATH")"
-            branch="$(jq -r '.client_payload.branch // empty' "$GITHUB_EVENT_PATH")"
-            run_url="$(jq -r '.client_payload.run_url // empty' "$GITHUB_EVENT_PATH")"
-            sha="$(jq -r '.client_payload.sha // empty' "$GITHUB_EVENT_PATH")"
-            slack_channel="$(jq -r '.client_payload.slack_channel // empty' "$GITHUB_EVENT_PATH")"
-            slack_thread_ts="$(jq -r '.client_payload.slack_thread_ts // empty' "$GITHUB_EVENT_PATH")"
-            if jq -e '.client_payload.failed_agents | type == "array"' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
-              agents_json="$(jq -c '.client_payload.failed_agents' "$GITHUB_EVENT_PATH")"
-            else
-              failed_agents_raw="$(jq -r '.client_payload.failed_agents // empty' "$GITHUB_EVENT_PATH")"
-              agents_json="$(csv_to_json "$failed_agents_raw")"
-            fi
-
-            if [ "$trigger_text" != "triage e2e" ]; then
-              echo "trigger_text must be exactly 'triage e2e'" >&2
+          # Derive missing values from run URL via GitHub API
+          if [ -z "$sha" ] || [ -z "$FAILED_AGENTS_INPUT" ]; then
+            run_id=$(echo "$run_url" | grep -oE '/runs/[0-9]+' | grep -oE '[0-9]+')
+            if [ -z "$run_id" ]; then
+              echo "Could not extract run ID from run_url: $run_url" >&2
               exit 1
             fi
-            if [ "$repo" != "$REPO_NAME" ]; then
-              echo "repo must match $REPO_NAME" >&2
-              exit 1
+            run_data=$(gh run view "$run_id" --repo "$REPO_NAME" --json headSha,jobs)
+            if [ -z "$sha" ]; then
+              sha=$(echo "$run_data" | jq -r '.headSha')
             fi
-            if [ "$branch" != "main" ]; then
-              echo "branch must be main" >&2
-              exit 1
+            if [ -z "$FAILED_AGENTS_INPUT" ]; then
+              agents_json=$(echo "$run_data" | jq -c '[.jobs[] | select(.conclusion == "failure") | .name | capture("\\((?<agent>[^)]+)\\)") | .agent]')
             fi
+          fi
+
+          if [ -n "$FAILED_AGENTS_INPUT" ]; then
+            agents_json="$(csv_to_json "$FAILED_AGENTS_INPUT")"
           fi
 
           if [ -z "$run_url" ]; then

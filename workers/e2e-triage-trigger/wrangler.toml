@@ -1,0 +1,3 @@
+name = "e2e-triage-trigger"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
