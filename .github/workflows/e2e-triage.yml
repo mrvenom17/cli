@@ -27,6 +27,7 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 concurrency:
   group: e2e-triage-${{ inputs.run_url || github.run_id }}
@@ -171,72 +172,70 @@ jobs:
       - name: Setup mise
         uses: jdx/mise-action@v4
 
-      - name: Install Claude CLI
+      - name: Download E2E artifacts
+        id: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          artifact_path="$(scripts/download-e2e-artifacts.sh "$RUN_URL")"
+          echo "path=$artifact_path" >> "$GITHUB_OUTPUT"
 
       - name: Run triage
         id: triage
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GH_TOKEN: ${{ github.token }}
-          TRIAGE_OUTPUT_FILE: ${{ github.workspace }}/e2e-triage-artifacts/${{ matrix.agent }}/triage.md
-          TRIAGE_SHA: ${{ needs.matrix-setup.outputs.sha }}
-        run: scripts/run-e2e-triage.sh
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: |
+            /e2e:triage-ci ${{ steps.artifacts.outputs.path }} --agent ${{ matrix.agent }} --sha ${{ needs.matrix-setup.outputs.sha }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--allowedTools 'Read,Grep,Glob'"
+          display_report: true
 
-      - name: Summarize triage output
-        id: summary
-        if: always()
+      - name: Extract triage output
+        id: triage_output
+        if: always() && steps.triage.outputs.execution_file != ''
         shell: bash
         env:
+          EXECUTION_FILE: ${{ steps.triage.outputs.execution_file }}
           TRIAGE_OUTPUT_FILE: ${{ github.workspace }}/e2e-triage-artifacts/${{ matrix.agent }}/triage.md
         run: |
           set -euo pipefail
 
-          summary=""
-          if [ -f "$TRIAGE_OUTPUT_FILE" ]; then
-            summary="$(
-              (grep '^## ' "$TRIAGE_OUTPUT_FILE" 2>/dev/null | head -n 3 | sed 's/^## //' | awk '
-                NF {
-                  if (out != "") {
-                    out = out " | "
-                  }
-                  out = out $0
-                }
-                END {
-                  print out
-                }
-              ') || true
-            )"
-          fi
+          mkdir -p "$(dirname "$TRIAGE_OUTPUT_FILE")"
+          # Extract assistant text content from execution JSON
+          jq -r '[.[] | select(.type == "assistant") | .message.content[]
+            | select(.type == "text") | .text] | join("\n")' \
+            "$EXECUTION_FILE" > "$TRIAGE_OUTPUT_FILE"
 
-          {
-            echo 'summary<<EOF'
-            printf '%s\n' "$summary"
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
+      - name: Generate fix plan
+        id: plan
+        if: steps.triage.outcome == 'success'
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: |
+            /e2e:implement Read the triage findings at ${{ github.workspace }}/e2e-triage-artifacts/${{ matrix.agent }}/triage.md for agent ${{ matrix.agent }}.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--allowedTools 'Read,Grep,Glob'"
+          display_report: true
 
-          # Print triage output to job summary
-          {
-            echo "## E2E Triage: ${E2E_AGENT}"
-            echo ""
-            if [ -f "$TRIAGE_OUTPUT_FILE" ] && [ -s "$TRIAGE_OUTPUT_FILE" ]; then
-              sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\[[?][0-9]*[a-zA-Z]//g' "$TRIAGE_OUTPUT_FILE"
-            else
-              echo "No triage output was produced."
-              echo ""
-              echo "The triage log file was either not created or is empty."
-              echo "Check the 'Run triage' step logs for details."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Extract plan output
+        id: plan_output
+        if: steps.plan.outcome == 'success'
+        shell: bash
+        env:
+          EXECUTION_FILE: ${{ steps.plan.outputs.execution_file }}
+          PLAN_FILE: ${{ github.workspace }}/e2e-triage-artifacts/${{ matrix.agent }}/plan.md
+        run: |
+          set -euo pipefail
+
+          jq -r '[.[] | select(.type == "assistant") | .message.content[]
+            | select(.type == "text") | .text] | join("\n")' \
+            "$EXECUTION_FILE" > "$PLAN_FILE"
 
       - name: Post triage completion
         if: ${{ always() && (steps.triage.outcome == 'success' || steps.triage.outcome == 'failure') && env.SLACK_BOT_TOKEN != '' && env.SLACK_CHANNEL != '' && env.SLACK_THREAD_TS != '' }}
         shell: bash
         env:
           TRIAGE_OUTCOME: ${{ steps.triage.outcome }}
-          TRIAGE_SUMMARY: ${{ steps.summary.outputs.summary }}
         run: |
           set -euo pipefail
 
@@ -245,9 +244,29 @@ jobs:
           else
             message="E2E triage failed for \`$E2E_AGENT\`."
           fi
-          if [ -n "$TRIAGE_SUMMARY" ]; then
-            message="$message $TRIAGE_SUMMARY"
-          fi
+
+          "$RUNNER_TEMP/post-slack-message.sh" "$message"
+
+      - name: Post fix plan to Slack
+        if: steps.plan.outcome == 'success' && env.SLACK_BOT_TOKEN != '' && env.SLACK_CHANNEL != '' && env.SLACK_THREAD_TS != ''
+        shell: bash
+        env:
+          PLAN_FILE: ${{ github.workspace }}/e2e-triage-artifacts/${{ matrix.agent }}/plan.md
+          TRIAGE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Extract first few lines as summary
+          summary="$(head -20 "$PLAN_FILE" | sed '/^$/d' | head -5)"
+
+          # Construct Fix It URL
+          encoded_run_url="$(python3 -c "import urllib.parse; print(urllib.parse.quote('$RUN_URL', safe=''))")"
+          fix_url="https://e2e-triage.entireio.workers.dev/fix?triage_run_id=${TRIAGE_RUN_ID}&run_url=${encoded_run_url}&failed_agents=${E2E_AGENT}&slack_channel=${SLACK_CHANNEL}&slack_thread_ts=${SLACK_THREAD_TS}"
+
+          message="Fix plan ready for \`$E2E_AGENT\`:
+          ${summary}
+
+          <${fix_url}|Fix It> — applies the plan and creates a draft PR"
 
           "$RUNNER_TEMP/post-slack-message.sh" "$message"
 
@@ -257,4 +276,12 @@ jobs:
         with:
           name: e2e-triage-${{ matrix.agent }}
           path: e2e-triage-artifacts/
+          retention-days: 7
+
+      - name: Upload plan artifact
+        if: always() && steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-plan-${{ matrix.agent }}
+          path: e2e-triage-artifacts/${{ matrix.agent }}/plan.md
           retention-days: 7
