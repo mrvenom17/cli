@@ -122,17 +122,14 @@ func (c *CodexAgent) InstallHooks(ctx context.Context, localDev bool, force bool
 		return 0, fmt.Errorf("failed to write hooks.json: %w", err)
 	}
 
-	// Enable the codex_hooks feature flag in the user-level ~/.codex/config.toml.
-	// This is required because codex_hooks is default_enabled: false (UnderDevelopment).
+	// Configure the user-level ~/.codex/config.toml:
+	// 1. Enable the codex_hooks feature flag (default off, stage: UnderDevelopment)
+	// 2. Trust this project so Codex loads .codex/hooks.json and .codex/config.toml
 	//
-	// We write to the user-level config (not project-level) because:
-	// - Project-level .codex/config.toml triggers Codex's trust system
-	// - Untrusted projects have their entire config layer disabled, which also
-	//   prevents hooks.json from being discovered
-	// - The feature flag is a global toggle ("process hooks.json files"), not
-	//   per-repo behavior — it's safe to enable globally
-	if err := ensureFeatureEnabled(); err != nil {
-		return count, fmt.Errorf("failed to enable codex_hooks feature: %w", err)
+	// Both are written to user-level config because project-level .codex/config.toml
+	// is only loaded for trusted projects — creating a chicken-and-egg problem.
+	if err := ensureUserConfig(repoRoot); err != nil {
+		return count, fmt.Errorf("failed to configure codex user config: %w", err)
 	}
 
 	return count, nil
@@ -305,9 +302,10 @@ const configFileName = "config.toml"
 // featureLine is the TOML line that enables the codex_hooks feature.
 const featureLine = "codex_hooks = true"
 
-// ensureFeatureEnabled ensures the codex_hooks feature flag is enabled
-// in the user-level ~/.codex/config.toml.
-func ensureFeatureEnabled() error {
+// ensureUserConfig configures ~/.codex/config.toml with:
+// 1. features.codex_hooks = true (enable hook processing)
+// 2. projects."<repoRoot>".trust_level = "trusted" (trust this repo's .codex/ config)
+func ensureUserConfig(repoRoot string) error {
 	codexHome := os.Getenv("CODEX_HOME")
 	if codexHome == "" {
 		homeDir, err := os.UserHomeDir()
@@ -325,22 +323,45 @@ func ensureFeatureEnabled() error {
 	}
 
 	content := string(data)
+	changed := false
 
-	// Already enabled — nothing to do
-	if strings.Contains(content, featureLine) {
-		return nil
+	// 1. Enable codex_hooks feature
+	if !strings.Contains(content, featureLine) {
+		if strings.Contains(content, "[features]") {
+			content = strings.Replace(content, "[features]", "[features]\n"+featureLine, 1)
+		} else {
+			if len(content) > 0 && !strings.HasSuffix(content, "\n") {
+				content += "\n"
+			}
+			content += "\n[features]\n" + featureLine + "\n"
+		}
+		changed = true
 	}
 
-	// Check if there's already a [features] section
-	if strings.Contains(content, "[features]") {
-		// Insert our line after the [features] header
-		content = strings.Replace(content, "[features]", "[features]\n"+featureLine, 1)
-	} else {
-		// Append a new [features] section
+	// 2. Trust this project (so .codex/hooks.json and .codex/config.toml are loaded)
+	// Resolve to absolute path for the trust key (Codex uses absolute paths).
+	absRoot, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+
+	trustSection := fmt.Sprintf("[projects.%q]", absRoot)
+	trustLine := `trust_level = "trusted"`
+
+	if !strings.Contains(content, trustSection) {
 		if len(content) > 0 && !strings.HasSuffix(content, "\n") {
 			content += "\n"
 		}
-		content += "\n[features]\n" + featureLine + "\n"
+		content += "\n" + trustSection + "\n" + trustLine + "\n"
+		changed = true
+	} else if !strings.Contains(content, trustLine) {
+		// Section exists but trust_level might be wrong or missing — leave it alone
+		// to avoid overriding explicit user settings.
+		_ = changed // no change
+	}
+
+	if !changed {
+		return nil
 	}
 
 	if err := os.MkdirAll(codexHome, 0o750); err != nil { //nolint:gosec // path from CODEX_HOME env or user home directory

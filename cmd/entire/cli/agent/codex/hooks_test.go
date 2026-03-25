@@ -36,12 +36,14 @@ func TestInstallHooks_CreatesConfig(t *testing.T) {
 	require.Contains(t, string(data), "entire hooks codex user-prompt-submit")
 	require.Contains(t, string(data), "entire hooks codex stop")
 
-	// Verify config.toml enables codex_hooks feature in user-level config
+	// Verify user-level config enables codex_hooks feature and trusts this project
 	configPath := filepath.Join(codexHome, configFileName)
 	configData, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 	require.Contains(t, string(configData), "codex_hooks = true")
 	require.Contains(t, string(configData), "[features]")
+	require.Contains(t, string(configData), `trust_level = "trusted"`)
+	require.Contains(t, string(configData), tempDir) // project path in trust entry
 }
 
 func TestInstallHooks_Idempotent(t *testing.T) {
