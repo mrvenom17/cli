@@ -240,17 +240,8 @@ func runTrailCreate(cmd *cobra.Command, title, body, base, branch, statusStr str
 	w := cmd.OutOrStdout()
 	errW := cmd.ErrOrStderr()
 
-	client, err := NewAuthenticatedAPIClient()
-	if err != nil {
-		return fmt.Errorf("authentication required: %w", err)
-	}
+	// --- Phase 1: Local git operations (no API calls) ---
 
-	host, owner, repoName, err := strategy.ResolveRemoteRepo(ctx, "origin")
-	if err != nil {
-		return fmt.Errorf("failed to resolve repository: %w", err)
-	}
-
-	// Open local repo for branch operations and base branch detection
 	repo, err := strategy.OpenRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to open repository: %w", err)
@@ -296,18 +287,31 @@ func runTrailCreate(cmd *cobra.Command, title, body, base, branch, statusStr str
 			return fmt.Errorf("failed to create branch %q: %w", branch, err)
 		}
 		fmt.Fprintf(w, "Created branch %s\n", branch)
+	} else if currentBranch != branch {
+		fmt.Fprintf(w, "Note: trail will be created for branch %q (not the current branch)\n", branch)
+	}
 
-		// Push the branch so the API can reference it
+	// Push the branch so the API can reference it
+	if needsCreation {
 		if err := pushBranchToOrigin(branch); err != nil {
 			fmt.Fprintf(errW, "Warning: failed to push branch: %v\n", err)
 		} else {
 			fmt.Fprintf(w, "Pushed branch %s to origin\n", branch)
 		}
-	} else if currentBranch != branch {
-		fmt.Fprintf(w, "Note: trail will be created for branch %q (not the current branch)\n", branch)
 	}
 
-	// Create the trail via API
+	// --- Phase 2: API operations ---
+
+	client, err := NewAuthenticatedAPIClient()
+	if err != nil {
+		return fmt.Errorf("authentication required: %w", err)
+	}
+
+	host, owner, repoName, err := strategy.ResolveRemoteRepo(ctx, "origin")
+	if err != nil {
+		return fmt.Errorf("failed to resolve repository: %w", err)
+	}
+
 	createReq := apiurl.TrailCreateRequest{
 		Title:      title,
 		Body:       body,
@@ -331,7 +335,8 @@ func runTrailCreate(cmd *cobra.Command, title, body, base, branch, statusStr str
 
 	fmt.Fprintf(w, "Created trail %q for branch %s (ID: %s)\n", createResp.Trail.Title, createResp.Trail.Branch, createResp.Trail.TrailID)
 
-	// Checkout the branch if requested or prompted
+	// --- Phase 3: Post-creation local operations ---
+
 	if needsCreation && currentBranch != branch {
 		shouldCheckout := checkout
 		if !shouldCheckout && !cmd.Flags().Changed("checkout") {
