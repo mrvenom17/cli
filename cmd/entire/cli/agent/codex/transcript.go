@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -317,7 +318,7 @@ func splitJSONL(data []byte) [][]byte {
 func parseSessionStartTime(data []byte) (time.Time, error) {
 	lines := splitJSONL(data)
 	if len(lines) == 0 {
-		return time.Time{}, fmt.Errorf("transcript is empty")
+		return time.Time{}, errors.New("transcript is empty")
 	}
 
 	var line rolloutLine
@@ -333,7 +334,7 @@ func parseSessionStartTime(data []byte) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse session_meta payload: %w", err)
 	}
 	if meta.Timestamp == "" {
-		return time.Time{}, fmt.Errorf("session_meta timestamp is empty")
+		return time.Time{}, errors.New("session_meta timestamp is empty")
 	}
 
 	startTime, err := time.Parse(time.RFC3339Nano, meta.Timestamp)
