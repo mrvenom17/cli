@@ -40,6 +40,9 @@ func (c *Codex) IsTransientError(out Output, err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
 	combined := out.Stdout + out.Stderr
 	for _, p := range []string{"overloaded", "rate limit", "rate_limit", "503", "529", "ECONNRESET", "ETIMEDOUT"} {
 		if strings.Contains(combined, p) {
