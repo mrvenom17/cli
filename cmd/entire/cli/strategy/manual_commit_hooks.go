@@ -1676,7 +1676,8 @@ func (s *ManualCommitStrategy) extractModifiedFilesFromLiveTranscript(ctx contex
 //     have /dev/tty but can't respond to prompts, and content detection fails
 //     since the shadow branch doesn't exist yet).
 func (s *ManualCommitStrategy) tryAgentCommitFastPath(ctx context.Context, commitMsgFile string, sessions []*SessionState, source string) bool {
-	skipContentDetection := !hasTTY()
+	noTTY := !hasTTY()
+	skipContentDetection := noTTY
 	if !skipContentDetection {
 		if stngs, err := settings.Load(ctx); err == nil {
 			skipContentDetection = stngs.GetCommitLinking() == settings.CommitLinkingAlways
@@ -1698,7 +1699,7 @@ func (s *ManualCommitStrategy) tryAgentCommitFastPath(ctx context.Context, commi
 		phases = append(phases, string(state.Phase))
 	}
 	logging.Debug(logCtx, "prepare-commit-msg: fast path found no ACTIVE sessions",
-		slog.Bool("no_tty", !hasTTY()),
+		slog.Bool("no_tty", noTTY),
 		slog.Int("sessions", len(sessions)),
 		slog.Any("session_phases", phases),
 	)
