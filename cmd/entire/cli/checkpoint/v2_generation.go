@@ -217,9 +217,19 @@ func (s *V2GitStore) nextGenerationNumber() (int, error) {
 func (s *V2GitStore) rotateGeneration(ctx context.Context) error {
 	refName := plumbing.ReferenceName(paths.V2FullCurrentRefName)
 
-	currentRef, err := s.repo.Reference(refName, true)
+	// Guard against concurrent rotation: if another instance already rotated,
+	// /full/current will have fewer checkpoints than the threshold.
+	gen, err := s.readGenerationFromRef(refName)
 	if err != nil {
 		return fmt.Errorf("rotation: failed to read /full/current: %w", err)
+	}
+	if len(gen.Checkpoints) < s.maxCheckpoints() {
+		return nil
+	}
+
+	currentRef, err := s.repo.Reference(refName, true)
+	if err != nil {
+		return fmt.Errorf("rotation: failed to read /full/current ref: %w", err)
 	}
 
 	archiveNumber, err := s.nextGenerationNumber()

@@ -445,17 +445,10 @@ func TestRotateGeneration_ArchivesCurrentAndCreatesNewOrphan(t *testing.T) {
 	t.Parallel()
 	repo := initTestRepo(t)
 	store := NewV2GitStore(repo)
-	ctx := context.Background()
+	store.MaxCheckpointsPerGeneration = 3
 
-	// Write 3 checkpoints to /full/current
+	// Write 3 checkpoints — the 3rd triggers auto-rotation via writeCommittedFullTranscript
 	cpIDs := populateFullCurrent(t, store, 3)
-
-	// Verify pre-rotation state
-	genBefore := v2FullGeneration(t, repo)
-	require.Len(t, genBefore.Checkpoints, 3)
-
-	// Rotate
-	require.NoError(t, store.rotateGeneration(ctx))
 
 	// --- Verify archived ref ---
 	archiveRefName := fmt.Sprintf("%s%013d", paths.V2FullRefPrefix, 1)
@@ -505,6 +498,7 @@ func TestRotateGeneration_SequentialNumbering(t *testing.T) {
 	t.Parallel()
 	repo := initTestRepo(t)
 	store := NewV2GitStore(repo)
+	store.MaxCheckpointsPerGeneration = 2
 	ctx := context.Background()
 
 	// First rotation: populate and rotate
