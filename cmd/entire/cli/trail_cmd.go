@@ -317,6 +317,7 @@ func runTrailCreate(cmd *cobra.Command, title, body, base, branch, statusStr str
 		Body:       body,
 		BranchName: branch,
 		Base:       base,
+		Status:     statusStr,
 	}
 
 	resp, err := client.Post(ctx, trailsBasePath(host, owner, repoName), createReq)
@@ -521,7 +522,7 @@ func buildTrailUpdateRequest(current *apiurl.TrailResource, statusStr, title, bo
 				}
 			}
 		}
-		req.Labels = labels
+		req.Labels = &labels
 	}
 
 	return req

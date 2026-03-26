@@ -129,8 +129,8 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*
 
 // DecodeJSON reads the response body and decodes it into dest.
 // It limits the body size to protect against unbounded reads.
+// The caller is responsible for closing resp.Body.
 func DecodeJSON(resp *http.Response, dest any) error {
-	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return fmt.Errorf("read response body: %w", err)
@@ -149,13 +149,13 @@ type ErrorResponse struct {
 }
 
 // CheckResponse returns an error if the response status code indicates failure.
-// For non-2xx responses, it attempts to parse the error message from the body.
+// For non-2xx responses, it reads and parses the error message from the body.
+// The caller is responsible for closing resp.Body.
 func CheckResponse(resp *http.Response) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
 
-	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return fmt.Errorf("API error: status %d", resp.StatusCode)

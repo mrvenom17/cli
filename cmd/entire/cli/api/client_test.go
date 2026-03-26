@@ -233,6 +233,7 @@ func TestCheckResponse_ErrorWithJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 
 	err = CheckResponse(resp)
 	if err == nil {
@@ -256,6 +257,7 @@ func TestCheckResponse_ErrorWithPlainText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 
 	err = CheckResponse(resp)
 	if err == nil {
@@ -279,6 +281,7 @@ func TestDecodeJSONResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 
 	var result struct {
 		ID     string `json:"id"`

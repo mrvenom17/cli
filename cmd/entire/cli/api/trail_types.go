@@ -65,12 +65,13 @@ func (r *TrailResource) ToMetadata() *trail.Metadata {
 	return m
 }
 
-// TrailCreateRequest is the body for POST /api/v1/trails/:org/:repo.
+// TrailCreateRequest is the body for POST /api/v1/trails/:host/:owner/:repo.
 type TrailCreateRequest struct {
 	Title      string   `json:"title"`
 	Body       string   `json:"body,omitempty"`
 	BranchName string   `json:"branch_name"`
 	Base       string   `json:"base,omitempty"`
+	Status     string   `json:"status,omitempty"`
 	Assignees  []string `json:"assignees,omitempty"`
 	Labels     []string `json:"labels,omitempty"`
 	Priority   string   `json:"priority,omitempty"`
@@ -90,18 +91,19 @@ type TrailDetailResponse struct {
 	Checkpoints trail.Checkpoints `json:"checkpoints"`
 }
 
-// TrailUpdateRequest is the body for PATCH /api/v1/trails/:org/:repo/:trailId.
-// Pointer fields distinguish "not provided" (nil) from "set to empty string".
+// TrailUpdateRequest is the body for PATCH /api/v1/trails/:host/:owner/:repo/:trailId.
+// Pointer fields distinguish "not provided" (nil) from "set to value".
+// For slices, *[]string is used so nil means "no change" while &[]string{} means "clear".
 type TrailUpdateRequest struct {
-	Branch    *string  `json:"branch,omitempty"`
-	Base      *string  `json:"base,omitempty"`
-	Status    *string  `json:"status,omitempty"`
-	Title     *string  `json:"title,omitempty"`
-	Body      *string  `json:"body,omitempty"`
-	Assignees []string `json:"assignees,omitempty"`
-	Labels    []string `json:"labels,omitempty"`
-	Priority  *string  `json:"priority,omitempty"`
-	Type      *string  `json:"type,omitempty"`
+	Branch    *string   `json:"branch,omitempty"`
+	Base      *string   `json:"base,omitempty"`
+	Status    *string   `json:"status,omitempty"`
+	Title     *string   `json:"title,omitempty"`
+	Body      *string   `json:"body,omitempty"`
+	Assignees *[]string `json:"assignees,omitempty"`
+	Labels    *[]string `json:"labels,omitempty"`
+	Priority  *string   `json:"priority,omitempty"`
+	Type      *string   `json:"type,omitempty"`
 }
 
 // TrailUpdateResponse is the response from PATCH /api/v1/trails/:org/:repo/:trailId.
