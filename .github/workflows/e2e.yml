@@ -16,6 +16,7 @@ on:
           - cursor-cli
           - copilot-cli
           - roger-roger
+          - codex
   push:
     branches:
       - main
