@@ -8,14 +8,14 @@ import (
 	"testing"
 )
 
-var defaultOpts = Options{
+var defaultOpts = MetadataFields{
 	Agent:      "claude-code",
 	CLIVersion: "0.5.1",
 	StartLine:  0,
 }
 
-func agentOpts(agent string) Options {
-	return Options{
+func agentOpts(agent string) MetadataFields {
+	return MetadataFields{
 		Agent:      agent,
 		CLIVersion: "0.5.1",
 		StartLine:  0,
@@ -358,7 +358,7 @@ var fixtureFullJSONL = strings.Join([]string{
 func TestCompact_FullFixture_WithTruncation(t *testing.T) {
 	t.Parallel()
 
-	opts := Options{Agent: "claude-code", CLIVersion: "0.5.1", StartLine: 3}
+	opts := MetadataFields{Agent: "claude-code", CLIVersion: "0.5.1", StartLine: 3}
 
 	// Starting at line 3 (user with tool_result), there's no preceding assistant
 	// to inline into, so user text is emitted and tool result is lost.
@@ -524,7 +524,7 @@ func TestCompact_StartLineBeyondEnd(t *testing.T) {
 
 	input := []byte(`{"type":"user","uuid":"u1","timestamp":"t1","message":{"content":"hello"}}
 `)
-	opts := Options{Agent: "claude-code", CLIVersion: "0.5.1", StartLine: 100}
+	opts := MetadataFields{Agent: "claude-code", CLIVersion: "0.5.1", StartLine: 100}
 
 	result, err := Compact(input, opts)
 	if err != nil {
@@ -571,7 +571,7 @@ func TestCompact_OnlyDroppedTypes(t *testing.T) {
 
 // --- Helpers ---
 
-func assertFixtureTransform(t *testing.T, opts Options, inputPath, expectedPath string) {
+func assertFixtureTransform(t *testing.T, opts MetadataFields, inputPath, expectedPath string) {
 	t.Helper()
 
 	input, err := os.ReadFile(inputPath)

@@ -61,7 +61,7 @@ type openCodeMsgToken struct {
 }
 
 // compactOpenCode converts a full OpenCode session JSON into transcript lines.
-func compactOpenCode(content []byte, opts Options) ([]byte, error) {
+func compactOpenCode(content []byte, opts MetadataFields) ([]byte, error) {
 	var session struct {
 		Messages []openCodeMessage `json:"messages"`
 	}

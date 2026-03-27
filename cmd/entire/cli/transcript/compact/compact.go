@@ -14,8 +14,8 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 )
 
-// Options provides metadata fields written to every output line.
-type Options struct {
+// MetadataFields provides metadata fields written to every output line.
+type MetadataFields struct {
 	Agent      string // e.g. "claude-code"
 	CLIVersion string // e.g. "0.42.0"
 	StartLine  int    // checkpoint_transcript_start (0 = no truncation)
@@ -37,7 +37,7 @@ type transcriptLine struct {
 
 // newTranscriptLine returns a transcriptLine pre-filled with the shared
 // metadata fields that are identical on every output line.
-func newTranscriptLine(opts Options) transcriptLine {
+func newTranscriptLine(opts MetadataFields) transcriptLine {
 	return transcriptLine{
 		V:          1,
 		Agent:      opts.Agent,
@@ -73,7 +73,7 @@ type userTextBlock struct {
 //
 //	{"v":1,"agent":"claude-code","cli_version":"0.42.0","type":"user","ts":"...","content":"..."}
 //	{"v":1,"agent":"claude-code","cli_version":"0.42.0","type":"assistant","ts":"...","id":"msg_xxx","content":[{"type":"text","text":"..."},{"type":"tool_use","id":"...","name":"...","input":{...},"result":{"output":"...","status":"..."}}]}
-func Compact(content []byte, opts Options) ([]byte, error) {
+func Compact(content []byte, opts MetadataFields) ([]byte, error) {
 	truncated := transcript.SliceFromLine(content, opts.StartLine)
 	if truncated == nil {
 		truncated = []byte{}
@@ -122,19 +122,8 @@ func normalizeKind(raw map[string]json.RawMessage) string {
 	return ""
 }
 
-// linePreprocessor transforms a parsed JSONL line before conversion.
-// Used by agent-specific converters to normalize their format (e.g., Droid
-// envelope unwrapping) before the shared pipeline processes it.
-type linePreprocessor func(map[string]json.RawMessage) map[string]json.RawMessage
-
 // compactJSONL converts JSONL transcripts (Claude Code, Cursor) into the
-// compact format.
-func compactJSONL(content []byte, opts Options) ([]byte, error) {
-	return compactJSONLWith(content, opts, nil)
-}
-
-// parsedEntry is an intermediate representation of a JSONL line used during
-// the two-pass compact conversion.
+// transcript.jsonl format
 type parsedEntry struct {
 	kind         string // "user" or "assistant"
 	ts           json.RawMessage
@@ -148,17 +137,11 @@ type parsedEntry struct {
 	toolResults  []toolResultEntry // user tool_result entries
 }
 
-// compactJSONLWith converts JSONL transcripts into the compact format.
-// It uses a two-pass approach:
-//  1. Parse all lines into intermediate entries
-//  2. Merge streaming assistant fragments (same msg ID), inline tool results
-//     from user lines into preceding assistant tool_use blocks, and drop
-//     tool-result-only user lines.
-func compactJSONLWith(content []byte, opts Options, preprocess linePreprocessor) ([]byte, error) {
+func compactJSONL(content []byte, opts MetadataFields) ([]byte, error) {
 	base := newTranscriptLine(opts)
 
 	// Pass 1: parse all lines into intermediate entries.
-	entries, err := parseJSONLEntries(content, preprocess)
+	entries, err := parseJSONLEntries(content)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +248,7 @@ func appendLine(result *[]byte, line transcriptLine) {
 
 // parseJSONLEntries parses all JSONL lines into intermediate entries,
 // filtering dropped types and malformed lines.
-func parseJSONLEntries(content []byte, preprocess linePreprocessor) ([]parsedEntry, error) {
+func parseJSONLEntries(content []byte) ([]parsedEntry, error) {
 	reader := bufio.NewReader(bytes.NewReader(content))
 	var entries []parsedEntry
 
@@ -276,7 +259,7 @@ func parseJSONLEntries(content []byte, preprocess linePreprocessor) ([]parsedEnt
 		}
 
 		if len(bytes.TrimSpace(lineBytes)) > 0 {
-			if e, ok := parseLine(lineBytes, preprocess); ok {
+			if e, ok := parseLine(lineBytes); ok {
 				entries = append(entries, e)
 			}
 		}
@@ -291,14 +274,10 @@ func parseJSONLEntries(content []byte, preprocess linePreprocessor) ([]parsedEnt
 
 // parseLine converts a single JSONL line into a parsedEntry.
 // Returns ok=false for dropped/malformed lines.
-func parseLine(lineBytes []byte, preprocess linePreprocessor) (parsedEntry, bool) {
+func parseLine(lineBytes []byte) (parsedEntry, bool) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(lineBytes, &raw); err != nil {
 		return parsedEntry{}, false
-	}
-
-	if preprocess != nil {
-		raw = preprocess(raw)
 	}
 
 	kind := normalizeKind(raw)
